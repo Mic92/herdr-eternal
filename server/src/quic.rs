@@ -16,8 +16,15 @@ use crate::ServerError;
 pub(crate) const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Where the UDP socket comes from: bound by us or inherited from systemd
+/// socket activation (so the port stays open across restarts).
+pub(crate) enum QuicSocket {
+    Addr(SocketAddr),
+    Inherited(std::net::UdpSocket),
+}
+
 pub(crate) fn listen(
-    addr: SocketAddr,
+    socket: QuicSocket,
     cert_pem: &Path,
     key_pem: &Path,
 ) -> Result<quinn::Endpoint, ServerError> {
@@ -46,5 +53,18 @@ pub(crate) fn listen(
     ));
     config.transport_config(Arc::new(transport));
 
-    Ok(quinn::Endpoint::server(config, addr)?)
+    match socket {
+        QuicSocket::Addr(addr) => Ok(quinn::Endpoint::server(config, addr)?),
+        QuicSocket::Inherited(socket) => {
+            socket.set_nonblocking(true)?;
+            let runtime = quinn::default_runtime()
+                .ok_or_else(|| std::io::Error::other("no async runtime for quinn"))?;
+            Ok(quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(config),
+                socket,
+                runtime,
+            )?)
+        }
+    }
 }

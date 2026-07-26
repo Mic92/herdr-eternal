@@ -135,7 +135,27 @@ impl Server {
         cert_pem: &Path,
         key_pem: &Path,
     ) -> Result<(), ServerError> {
-        let endpoint = quic::listen(addr, cert_pem, key_pem)?;
+        self.enable_quic_endpoint(quic::QuicSocket::Addr(addr), cert_pem, key_pem)
+    }
+
+    /// Like [`enable_quic`](Self::enable_quic), but on a UDP socket inherited
+    /// from systemd socket activation so the port stays open across restarts.
+    pub fn enable_quic_from_socket(
+        &mut self,
+        socket: std::net::UdpSocket,
+        cert_pem: &Path,
+        key_pem: &Path,
+    ) -> Result<(), ServerError> {
+        self.enable_quic_endpoint(quic::QuicSocket::Inherited(socket), cert_pem, key_pem)
+    }
+
+    fn enable_quic_endpoint(
+        &mut self,
+        socket: quic::QuicSocket,
+        cert_pem: &Path,
+        key_pem: &Path,
+    ) -> Result<(), ServerError> {
+        let endpoint = quic::listen(socket, cert_pem, key_pem)?;
         info!(addr = %endpoint.local_addr()?, "listening (quic)");
         self.quic = Some(endpoint);
         Ok(())

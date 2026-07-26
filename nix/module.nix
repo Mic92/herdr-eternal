@@ -153,7 +153,6 @@ in
             "--oidc-allowed-sub ${cfg.oidc.allowedSub}"
           ]
           ++ lib.optionals cfg.quic.enable [
-            "--quic-listen ${cfg.quic.listenAddress}"
             "--quic-cert %d/quic-cert"
             "--quic-key %d/quic-key"
           ]
@@ -184,6 +183,9 @@ in
     systemd.sockets.herdr-eternal-server = {
       wantedBy = [ "sockets.target" ];
       listenStreams = [ cfg.listenAddress ];
+      # QUIC's UDP socket is also owned by systemd so the port stays open
+      # across service restarts.
+      listenDatagrams = lib.optional cfg.quic.enable cfg.quic.listenAddress;
     };
 
     services.nginx.virtualHosts.${cfg.nginx.hostName} = lib.mkIf cfg.nginx.enable {

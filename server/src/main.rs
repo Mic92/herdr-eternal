@@ -16,20 +16,26 @@ fn usage() -> ExitCode {
          The token file contains the pre-shared token clients may present.\n\
          With --oidc-* set, OIDC bearer tokens from that issuer are also accepted.\n\
          Without --listen, a listener from systemd socket activation is expected.\n\
-         With --quic-* set, direct QUIC connections are also accepted.\n\
+         With --quic-cert/--quic-key set, direct QUIC connections are also accepted,\n\
+         on --quic-listen or on a datagram socket from socket activation.\n\
          Disconnected sessions are killed after the session timeout (default 7 days)."
     );
     ExitCode::FAILURE
 }
 
-/// Fds passed in by systemd: the listening socket from socket activation and
-/// any session fds a previous instance pushed into the fd store (named
-/// `<token>.<role>`).
-fn activation_fds() -> (Option<std::net::TcpListener>, Vec<(String, OwnedFd)>) {
+/// Fds passed in by systemd: the listening sockets from socket activation
+/// (TCP for WebSocket, UDP for QUIC) and any session fds a previous instance
+/// pushed into the fd store (named `<token>.<role>`).
+fn activation_fds() -> (
+    Option<std::net::TcpListener>,
+    Option<std::net::UdpSocket>,
+    Vec<(String, OwnedFd)>,
+) {
     let mut listener = None;
+    let mut quic_socket = None;
     let mut sessions = Vec::new();
     let Ok(fds) = sd_notify::listen_fds_with_names(true) else {
-        return (listener, sessions);
+        return (listener, quic_socket, sessions);
     };
     const SESSION_ROLES: [&str; 4] = [".stdin", ".stdout", ".stderr", ".exit"];
     for (fd, name) in fds {
@@ -38,11 +44,18 @@ fn activation_fds() -> (Option<std::net::TcpListener>, Vec<(String, OwnedFd)>) {
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         if SESSION_ROLES.iter().any(|role| name.ends_with(role)) {
             sessions.push((name, fd));
+        } else if is_datagram(&fd) {
+            quic_socket.get_or_insert(std::net::UdpSocket::from(fd));
         } else if listener.is_none() {
             listener = Some(std::net::TcpListener::from(fd));
         }
     }
-    (listener, sessions)
+    (listener, quic_socket, sessions)
+}
+
+fn is_datagram(fd: &OwnedFd) -> bool {
+    nix::sys::socket::getsockopt(fd, nix::sys::socket::sockopt::SockType)
+        .is_ok_and(|kind| kind == nix::sys::socket::SockType::Datagram)
 }
 
 /// The user's login shell from the passwd database, like sshd uses.
@@ -86,13 +99,16 @@ fn main() -> ExitCode {
             _ => return usage(),
         }
     }
-    let quic = match (quic_listen, quic_cert, quic_key) {
-        (Some(addr), Some(cert), Some(key)) => Some((addr, cert, key)),
+    let quic = match (&quic_listen, quic_cert, quic_key) {
+        (_, Some(cert), Some(key)) => Some((cert, key)),
         (None, None, None) => None,
         _ => return usage(),
     };
-    let (activation, session_fds) = activation_fds();
+    let (activation, quic_socket, session_fds) = activation_fds();
     if listen.is_none() && activation.is_none() {
+        return usage();
+    }
+    if quic.is_some() && quic_listen.is_none() && quic_socket.is_none() {
         return usage();
     }
     let static_token = match token_file {
@@ -135,9 +151,16 @@ fn main() -> ExitCode {
         if let Some(timeout) = session_timeout {
             server.set_session_timeout(timeout);
         }
-        if let Some((addr, cert, key)) = &quic {
-            let addr = addr.parse().map_err(std::io::Error::other)?;
-            server.enable_quic(addr, Path::new(cert), Path::new(key))?;
+        if let Some((cert, key)) = &quic {
+            let (cert, key) = (Path::new(cert), Path::new(key));
+            match (quic_socket, &quic_listen) {
+                (Some(socket), _) => server.enable_quic_from_socket(socket, cert, key)?,
+                (None, Some(addr)) => {
+                    let addr = addr.parse().map_err(std::io::Error::other)?;
+                    server.enable_quic(addr, cert, key)?;
+                }
+                (None, None) => unreachable!("checked above"),
+            }
         }
         // Set by systemd for RuntimeDirectory=; gives forwarded agent sockets
         // a stable path that survives daemon restarts and holds the state of
