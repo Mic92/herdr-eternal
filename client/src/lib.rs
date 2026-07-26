@@ -1,18 +1,18 @@
-//! Client side of the herdr-eternal transport: connect to the server over
-//! WebSocket, run one command, and relay stdio (see PLAN.md).
+//! Client side of the herdr-eternal transport: connect to the server (QUIC
+//! when configured, WebSocket otherwise), run one command, and relay stdio
+//! (see PLAN.md).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use futures_util::{SinkExt, StreamExt};
 use herdr_eternal_proto as proto;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 mod agent;
+mod channel;
 pub mod oidc;
+use channel::{Conn, Event};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -65,6 +65,12 @@ pub struct TargetConfig {
     /// Forward the local SSH agent (`SSH_AUTH_SOCK`) into the session.
     #[serde(default)]
     pub forward_agent: bool,
+    /// Direct QUIC endpoint (`host:port`); tried first, with the WebSocket
+    /// URL as fallback. Roaming benefits from QUIC connection migration.
+    pub quic_addr: Option<String>,
+    /// Extra trusted CA certificate (PEM) for the QUIC endpoint, on top of
+    /// the system trust store.
+    pub quic_ca: Option<PathBuf>,
 }
 
 impl TargetConfig {
@@ -76,6 +82,8 @@ impl TargetConfig {
             None => oidc::access_token(name, self).await?,
         };
         let mut target = Target::new(self.url.clone(), token);
+        target.quic_addr = self.quic_addr.clone();
+        target.quic_ca = self.quic_ca.clone();
         if self.forward_agent {
             // Without a local agent there is nothing to forward, like ssh -A.
             target.agent_socket = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
@@ -99,6 +107,10 @@ pub struct Target {
     pub connect_timeout: std::time::Duration,
     /// Local SSH agent socket to forward into the session, if any.
     pub agent_socket: Option<PathBuf>,
+    /// Direct QUIC endpoint (`host:port`), preferred over the WebSocket URL.
+    pub quic_addr: Option<String>,
+    /// Extra trusted CA certificate (PEM) for the QUIC endpoint.
+    pub quic_ca: Option<PathBuf>,
 }
 
 impl Target {
@@ -110,6 +122,8 @@ impl Target {
             keepalive_timeout: std::time::Duration::from_secs(30),
             connect_timeout: std::time::Duration::from_secs(10),
             agent_socket: None,
+            quic_addr: None,
+            quic_ca: None,
         }
     }
 }
@@ -188,8 +202,8 @@ pub async fn run_exec(
             target.connect_timeout,
             connect_and_start(target, command, &resume_token, last_server_seq),
         );
-        let mut ws = match connect.await.unwrap_or(Err(ClientError::ConnectTimeout)) {
-            Ok((ws, token)) => {
+        let mut conn = match connect.await.unwrap_or(Err(ClientError::ConnectTimeout)) {
+            Ok((conn, token)) => {
                 if resume_token.is_none() {
                     resume_token = token;
                 }
@@ -202,7 +216,7 @@ pub async fn run_exec(
                         ))));
                     }
                 }
-                ws
+                conn
             }
             Err(err) => {
                 // resume_deadline is only set after a resumable session dropped.
@@ -220,7 +234,7 @@ pub async fn run_exec(
             // Resend stdin the server may not have seen; it deduplicates by seq.
             // Send failures are disconnects and handled by the resume loop.
             for message in &sent_stdin {
-                if send(&mut ws, message).await.is_err() {
+                if conn.send(message).await.is_err() {
                     return Ok(None);
                 }
             }
@@ -231,13 +245,15 @@ pub async fn run_exec(
 
             loop {
                 tokio::select! {
-                    _ = keepalive.tick() => {
+                    // QUIC has its own keepalive and idle timeout; only the
+                    // WebSocket path needs application-level pings.
+                    _ = keepalive.tick(), if conn.needs_ping() => {
                         // A blackholed connection never errors; the missing
                         // pong (or any other traffic) is what gives it away.
                         if last_activity.elapsed() >= target.keepalive_timeout {
                             return Ok(None);
                         }
-                        if ws.send(Message::Ping(Vec::new())).await.is_err() {
+                        if conn.ping().await.is_err() {
                             return Ok(None);
                         }
                     }
@@ -251,29 +267,29 @@ pub async fn run_exec(
                             proto::ChannelMessage::Stdin { seq: client_seq, data: stdin_buf[..n].to_vec() }
                         };
                         sent_stdin.push(message.clone());
-                        if send(&mut ws, &message).await.is_err() {
+                        if conn.send(&message).await.is_err() {
                             return Ok(None);
                         }
                     }
-                    message = ws.next() => {
+                    event = conn.next() => {
                         last_activity = tokio::time::Instant::now();
-                        match message {
-                            Some(Ok(Message::Binary(bytes))) => match proto::decode(&bytes)? {
+                        match event? {
+                            Event::Frame(bytes) => match proto::decode(&bytes)? {
                                 proto::ChannelMessage::Stdout { seq, data } if seq > last_server_seq => {
                                     last_server_seq = seq;
                                     stdout.write_all(&data).await?;
                                     stdout.flush().await?;
-                                    ack(&mut ws, last_server_seq).await;
+                                    ack(&mut conn, last_server_seq).await;
                                 }
                                 proto::ChannelMessage::Stderr { seq, data } if seq > last_server_seq => {
                                     last_server_seq = seq;
                                     stderr.write_all(&data).await?;
                                     stderr.flush().await?;
-                                    ack(&mut ws, last_server_seq).await;
+                                    ack(&mut conn, last_server_seq).await;
                                 }
                                 proto::ChannelMessage::Exit { seq, code } => {
                                     // Confirm delivery so the server can drop the session.
-                                    ack(&mut ws, seq).await;
+                                    ack(&mut conn, seq).await;
                                     return Ok(Some(code));
                                 }
                                 proto::ChannelMessage::Ack { seq: acked } => {
@@ -285,9 +301,7 @@ pub async fn run_exec(
                                 }
                                 _ => {}
                             },
-                            Some(Ok(Message::Close(_))) | None => return Ok(None),
-                            Some(Ok(_)) => {}
-                            Some(Err(_)) => return Ok(None),
+                            Event::Disconnected => return Ok(None),
                         }
                     }
                 }
@@ -309,13 +323,9 @@ pub async fn run_exec(
 
 /// Tells the server which of its messages we have persisted, so it can trim
 /// its replay buffer. Failures surface on the next send/receive.
-async fn ack(ws: &mut Ws, seq: u64) {
-    if let Ok(bytes) = proto::encode(&proto::ChannelMessage::Ack { seq }) {
-        ws.send(Message::Binary(bytes)).await.ok();
-    }
+async fn ack(conn: &mut Conn, seq: u64) {
+    conn.send(&proto::ChannelMessage::Ack { seq }).await.ok();
 }
-
-type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Connects, authenticates, and starts or resumes the exec session.
 async fn connect_and_start(
@@ -323,21 +333,16 @@ async fn connect_and_start(
     command: &str,
     resume_token: &Option<String>,
     last_server_seq: u64,
-) -> Result<(Ws, Option<String>), ClientError> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(&target.url)
-        .await
-        .map_err(Box::new)?;
+) -> Result<(Conn, Option<String>), ClientError> {
+    let mut conn = Conn::connect(target).await?;
 
-    send(
-        &mut ws,
-        &proto::Hello {
-            token: target.token.clone(),
-            client_name: "herdr-eternal-ssh".to_string(),
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-    )
+    conn.send(&proto::Hello {
+        token: target.token.clone(),
+        client_name: "herdr-eternal-ssh".to_string(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+    })
     .await?;
-    let _welcome: proto::Welcome = recv(&mut ws).await?;
+    let _welcome: proto::Welcome = conn.recv().await?;
 
     let request = match resume_token {
         Some(resume_token) => proto::ExecRequest::Resume {
@@ -350,38 +355,12 @@ async fn connect_and_start(
             forward_agent: target.agent_socket.is_some(),
         },
     };
-    send(&mut ws, &request).await?;
+    conn.send(&request).await?;
 
-    let proto::ChannelMessage::Started { resume_token } = recv(&mut ws).await? else {
+    let proto::ChannelMessage::Started { resume_token } = conn.recv().await? else {
         return Err(ClientError::ConnectionClosed);
     };
-    Ok((ws, resume_token))
-}
-
-async fn send<S, T>(ws: &mut S, msg: &T) -> Result<(), ClientError>
-where
-    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-    T: serde::Serialize,
-{
-    ws.send(Message::Binary(proto::encode(msg)?))
-        .await
-        .map_err(Box::new)?;
-    Ok(())
-}
-
-async fn recv<S, T>(ws: &mut S) -> Result<T, ClientError>
-where
-    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
-    T: serde::de::DeserializeOwned,
-{
-    loop {
-        match ws.next().await {
-            Some(Ok(Message::Binary(bytes))) => return Ok(proto::decode(&bytes)?),
-            Some(Ok(Message::Close(_))) | None => return Err(ClientError::ConnectionClosed),
-            Some(Ok(_)) => continue,
-            Some(Err(err)) => return Err(Box::new(err).into()),
-        }
-    }
+    Ok((conn, resume_token))
 }
 
 #[cfg(test)]

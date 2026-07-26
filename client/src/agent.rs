@@ -9,14 +9,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use herdr_eternal_proto as proto;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
 
-use crate::{ClientError, Target, Ws, recv, send};
+use crate::channel::{Conn, Event};
+use crate::{ClientError, Target};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
@@ -24,41 +23,33 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// lets this future run; reconnects after connection drops.
 pub(crate) async fn forward_agent(target: Target, resume_token: String, agent_socket: PathBuf) {
     loop {
-        if let Ok(ws) = connect_agent_channel(&target, &resume_token).await {
-            relay_agent_channel(ws, &agent_socket).await;
+        if let Ok(conn) = connect_agent_channel(&target, &resume_token).await {
+            relay_agent_channel(conn, &agent_socket).await;
         }
         tokio::time::sleep(RECONNECT_DELAY).await;
     }
 }
 
-async fn connect_agent_channel(target: &Target, resume_token: &str) -> Result<Ws, ClientError> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(&target.url)
-        .await
-        .map_err(Box::new)?;
-    send(
-        &mut ws,
-        &proto::Hello {
-            token: target.token.clone(),
-            client_name: "herdr-eternal-ssh (agent)".to_string(),
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-    )
+async fn connect_agent_channel(target: &Target, resume_token: &str) -> Result<Conn, ClientError> {
+    let mut conn = Conn::connect(target).await?;
+    conn.send(&proto::Hello {
+        token: target.token.clone(),
+        client_name: "herdr-eternal-ssh (agent)".to_string(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+    })
     .await?;
-    let _welcome: proto::Welcome = recv(&mut ws).await?;
-    send(
-        &mut ws,
-        &proto::ExecRequest::AgentChannel {
-            resume_token: resume_token.to_string(),
-        },
-    )
+    let _welcome: proto::Welcome = conn.recv().await?;
+    conn.send(&proto::ExecRequest::AgentChannel {
+        resume_token: resume_token.to_string(),
+    })
     .await?;
-    Ok(ws)
+    Ok(conn)
 }
 
 /// Serves one agent channel connection until it drops.
-async fn relay_agent_channel(mut ws: Ws, agent_socket: &Path) {
+async fn relay_agent_channel(mut conn: Conn, agent_socket: &Path) {
     // Local reads from all agent connections funnel through one queue so a
-    // single task owns the WebSocket writer.
+    // single task owns the connection's writer.
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<proto::ChannelMessage>();
     let mut streams: HashMap<u64, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
 
@@ -67,14 +58,13 @@ async fn relay_agent_channel(mut ws: Ws, agent_socket: &Path) {
             outbound = outbound_rx.recv() => {
                 // outbound_tx lives in this scope, so recv() cannot return None.
                 let Some(message) = outbound else { return };
-                let Ok(bytes) = proto::encode(&message) else { return };
-                if ws.send(Message::Binary(bytes)).await.is_err() {
+                if conn.send(&message).await.is_err() {
                     return;
                 }
             }
-            message = ws.next() => {
-                match message {
-                    Some(Ok(Message::Binary(bytes))) => {
+            event = conn.next() => {
+                match event {
+                    Ok(Event::Frame(bytes)) => {
                         let Ok(message) = proto::decode(&bytes) else { return };
                         match message {
                             proto::ChannelMessage::AgentOpen { id } => {
@@ -98,8 +88,7 @@ async fn relay_agent_channel(mut ws: Ws, agent_socket: &Path) {
                             _ => {}
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                    Some(Ok(_)) => {}
+                    Ok(Event::Disconnected) | Err(_) => return,
                 }
             }
         }
