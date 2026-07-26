@@ -1,0 +1,11 @@
+[package]
+name = "herdr-eternal-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Companion server providing exec channels for herdr --remote over WebSocket/QUIC"
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

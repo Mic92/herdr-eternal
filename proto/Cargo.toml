@@ -1,0 +1,12 @@
+[package]
+name = "herdr-eternal-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire protocol for herdr-eternal transport (exec channels with resume)"
+
+[dependencies]
+serde = { workspace = true }
+postcard = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "herdr-eternal-ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ssh-argument-compatible client for herdr --remote over the herdr-eternal transport"
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

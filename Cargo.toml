@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["proto", "server", "client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Mic92/herdr-eternal-server"
+
+[workspace.dependencies]
+herdr-eternal-proto = { path = "proto" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
