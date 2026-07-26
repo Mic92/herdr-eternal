@@ -60,6 +60,32 @@ in
       };
     };
 
+    quic = {
+      enable = lib.mkEnableOption "a direct QUIC listener (roaming clients get connection migration)";
+
+      listenAddress = lib.mkOption {
+        type = lib.types.str;
+        default = "[::]:7443";
+        description = "Address the QUIC (UDP) listener binds to; reachable directly, not via nginx.";
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 7443;
+        description = "UDP port opened in the firewall for the QUIC listener.";
+      };
+
+      certFile = lib.mkOption {
+        type = lib.types.path;
+        description = "TLS certificate chain (PEM) for the QUIC listener, e.g. the host's ACME cert.";
+      };
+
+      keyFile = lib.mkOption {
+        type = lib.types.path;
+        description = "TLS private key (PEM) matching certFile.";
+      };
+    };
+
     nginx = {
       enable = lib.mkEnableOption "an nginx location proxying WebSocket traffic to the server";
 
@@ -112,13 +138,26 @@ in
             "--oidc-client-id ${cfg.oidc.clientId}"
             "--oidc-allowed-sub ${cfg.oidc.allowedSub}"
           ]
+          ++ lib.optionals cfg.quic.enable [
+            "--quic-listen ${cfg.quic.listenAddress}"
+            "--quic-cert %d/quic-cert"
+            "--quic-key %d/quic-key"
+          ]
         );
-        LoadCredential = lib.optional (cfg.tokenFile != null) "token:${cfg.tokenFile}";
+        LoadCredential =
+          lib.optional (cfg.tokenFile != null) "token:${cfg.tokenFile}"
+          ++ lib.optionals cfg.quic.enable [
+            # Credentials so the unprivileged user can read the ACME key.
+            "quic-cert:${cfg.quic.certFile}"
+            "quic-key:${cfg.quic.keyFile}"
+          ];
         User = cfg.user;
         Restart = "on-failure";
         RestartSec = 2;
       };
     };
+
+    networking.firewall.allowedUDPPorts = lib.mkIf cfg.quic.enable [ cfg.quic.port ];
 
     # Socket activation: the listener stays open across service restarts, so
     # deploys do not refuse connections while the daemon comes back up.

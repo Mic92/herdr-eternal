@@ -39,12 +39,20 @@ invisible to herdr.
       hostName = "example.com";           # existing TLS-terminating vhost
       location = "/herdr-eternal";
     };
+    # Optional direct QUIC listener (roaming clients get connection
+    # migration); reuses the ACME cert nginx already has.
+    quic = {
+      enable = true;
+      certFile = "/var/lib/acme/example.com/fullchain.pem";
+      keyFile = "/var/lib/acme/example.com/key.pem";
+    };
   };
 }
 ```
 
-The server only listens on localhost; nginx terminates TLS and proxies the
-WebSocket upgrade.
+The WebSocket listener stays on localhost; nginx terminates TLS and proxies
+the upgrade. The QUIC listener (UDP 7443 by default) terminates TLS itself
+and is opened in the firewall.
 
 ## Client configuration
 
@@ -61,6 +69,9 @@ client_id = "herdr-eternal"
 # Optional: expose the local SSH agent as SSH_AUTH_SOCK in the session
 # (same trust implications as `ssh -A`).
 forward_agent = true
+# Optional: try a direct QUIC connection first, falling back to the
+# WebSocket URL when UDP is blocked.
+quic_addr = "example.com:7443"
 ```
 
 herdr config:
@@ -94,4 +105,4 @@ $ nix flake check   # clippy, tests (incl. patched-herdr e2e), NixOS VM test
 - [x] sshd-like sessions: login shell from passwd, clean login environment
 - [x] Socket activation and readiness notification (no accept gap on restart)
 - [x] Sessions survive daemon restarts (systemd fd store handover)
-- [ ] Optional QUIC direct path (connection migration)
+- [x] Optional QUIC direct path (connection migration), WebSocket fallback

@@ -5,6 +5,16 @@
   nixosModule,
   package,
 }:
+let
+  # Self-signed cert for the QUIC listener; only used inside the test VM.
+  quicCert = pkgs.runCommand "herdr-eternal-test-cert" { nativeBuildInputs = [ pkgs.openssl ]; } ''
+    mkdir -p $out
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 \
+      -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+      -addext basicConstraints=critical,CA:FALSE \
+      -keyout $out/key.pem -out $out/cert.pem
+  '';
+in
 pkgs.testers.runNixOSTest {
   name = "herdr-eternal-server";
 
@@ -25,6 +35,11 @@ pkgs.testers.runNixOSTest {
         enable = true;
         user = "alice";
         tokenFile = pkgs.writeText "herdr-eternal-token" "test-token";
+        quic = {
+          enable = true;
+          certFile = "${quicCert}/cert.pem";
+          keyFile = "${quicCert}/key.pem";
+        };
         nginx = {
           enable = true;
           hostName = "localhost";
@@ -49,7 +64,9 @@ pkgs.testers.runNixOSTest {
 
     machine.succeed(
         "mkdir -p /root/.config/herdr-eternal",
-        "printf '[targets.testbox]\nurl = \"ws://localhost/herdr-eternal\"\ntoken = \"test-token\"\nforward_agent = true\n' > /root/.config/herdr-eternal/config.toml",
+        "printf '[targets.testbox]\nurl = \"ws://localhost/herdr-eternal\"\ntoken = \"test-token\"\nforward_agent = true\n"
+        "[targets.testbox-quic]\nurl = \"ws://127.0.0.1:1\"\nquic_addr = \"127.0.0.1:7443\"\nquic_ca = \"${quicCert}/cert.pem\"\ntoken = \"test-token\"\n' "
+        "> /root/.config/herdr-eternal/config.toml",
     )
 
     # Sessions get a login-like environment: identity from passwd, a working
@@ -65,6 +82,11 @@ pkgs.testers.runNixOSTest {
 
     # Exit codes must be propagated through nginx as well.
     machine.fail("herdr-eternal-ssh -T testbox 'exit 3' < /dev/null")
+
+    # The direct QUIC path: the target's WebSocket URL points nowhere, so
+    # only the QUIC listener can have answered.
+    output = machine.succeed("herdr-eternal-ssh -T testbox-quic 'echo over-quic' < /dev/null")
+    assert output == "over-quic\n", repr(output)
 
     # A restart mid-session must lose neither output nor the exit code
     # (handover through the systemd fd store).
