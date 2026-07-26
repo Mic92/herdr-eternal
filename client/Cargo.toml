@@ -19,3 +19,4 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 herdr-eternal-server = { path = "../server" }
+tempfile = { workspace = true }

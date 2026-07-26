@@ -180,9 +180,8 @@ mod tests {
 
     #[test]
     fn load_target_finds_configured_entry() {
-        let dir = std::env::temp_dir().join(format!("herdr-eternal-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
             "[targets.workbox]\nurl = \"ws://127.0.0.1:8422\"\ntoken = \"secret\"\n",
@@ -197,6 +196,5 @@ mod tests {
             load_target(&path, "other"),
             Err(ClientError::UnknownTarget(name)) if name == "other"
         ));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

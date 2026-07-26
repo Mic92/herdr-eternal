@@ -8,6 +8,8 @@
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     crane.url = "github:ipetkov/crane";
+    # Pinned to the commit the remote.ssh_command patch applies to.
+    herdr.url = "github:ogulcancelik/herdr/e7fc85bfdb51f89488430adbfe5bbced3be79c2f";
   };
 
   outputs =
@@ -23,6 +25,13 @@
         { pkgs, ... }:
         let
           craneLib = inputs.crane.mkLib pkgs;
+          # herdr with the remote.ssh_command option, used by the herdr-driven
+          # integration test in client/tests/.
+          herdrPatched = inputs.herdr.packages.${pkgs.stdenv.hostPlatform.system}.herdr.overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [
+              ./nix/patches/0001-remote-make-ssh-transport-program-configurable.patch
+            ];
+          });
           src = craneLib.cleanCargoSource ./.;
           commonArgs = {
             inherit src;
@@ -47,14 +56,22 @@
                 cargoClippyExtraArgs = "--all-targets -- -D warnings";
               }
             );
-            tests = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
+            tests = craneLib.cargoTest (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                # The herdr-driven end-to-end test needs herdr in PATH.
+                nativeCheckInputs = [ herdrPatched ];
+              }
+            );
           };
 
           devShells.default = craneLib.devShell {
-            packages = with pkgs; [
-              clippy
-              rustfmt
-              rust-analyzer
+            packages = [
+              pkgs.clippy
+              pkgs.rustfmt
+              pkgs.rust-analyzer
+              herdrPatched
             ];
           };
 

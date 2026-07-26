@@ -17,5 +17,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "proces
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 toml = "0.8"
+tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
