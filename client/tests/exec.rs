@@ -1,7 +1,7 @@
 //! End-to-end test: client library against the real server.
 
 use herdr_eternal_server::Server;
-use herdr_eternal_ssh::{run_exec, Target};
+use herdr_eternal_ssh::{Target, run_exec};
 
 #[tokio::test]
 async fn exec_roundtrip_through_client_and_server() {

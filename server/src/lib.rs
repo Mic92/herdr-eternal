@@ -8,8 +8,8 @@ use futures_util::{SinkExt, StreamExt};
 use herdr_eternal_proto as proto;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 #[derive(Debug, thiserror::Error)]

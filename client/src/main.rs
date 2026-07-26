@@ -5,7 +5,7 @@
 
 use std::process::ExitCode;
 
-use herdr_eternal_ssh::{default_config_path, load_target, run_exec, ClientError};
+use herdr_eternal_ssh::{ClientError, default_config_path, load_target, run_exec};
 
 /// The subset of ssh's command line that herdr emits.
 #[derive(Debug, PartialEq, Eq)]
