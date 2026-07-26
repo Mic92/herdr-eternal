@@ -20,6 +20,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
@@ -32,3 +35,4 @@ base64 = { workspace = true, optional = true }
 
 [dev-dependencies]
 herdr-eternal-server = { path = ".", features = ["test-util"] }
+rcgen = { workspace = true }

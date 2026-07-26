@@ -12,9 +12,11 @@ fn usage() -> ExitCode {
         "usage: herdr-eternal-server [--listen <addr:port>] [--token-file <path>]\n\
          \x20                          [--oidc-issuer <url> --oidc-client-id <id> --oidc-allowed-sub <sub>]\n\
          \x20                          [--session-timeout-secs <secs>]\n\
+         \x20                          [--quic-listen <addr:port> --quic-cert <pem> --quic-key <pem>]\n\
          The token file contains the pre-shared token clients may present.\n\
          With --oidc-* set, OIDC bearer tokens from that issuer are also accepted.\n\
          Without --listen, a listener from systemd socket activation is expected.\n\
+         With --quic-* set, direct QUIC connections are also accepted.\n\
          Disconnected sessions are killed after the session timeout (default 7 days)."
     );
     ExitCode::FAILURE
@@ -66,10 +68,16 @@ fn main() -> ExitCode {
     let mut oidc_client_id = None;
     let mut oidc_allowed_sub = None;
     let mut session_timeout_secs = None;
+    let mut quic_listen = None;
+    let mut quic_cert = None;
+    let mut quic_key = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => listen = args.next(),
+            "--quic-listen" => quic_listen = args.next(),
+            "--quic-cert" => quic_cert = args.next(),
+            "--quic-key" => quic_key = args.next(),
             "--token-file" => token_file = args.next(),
             "--oidc-issuer" => oidc_issuer = args.next(),
             "--oidc-client-id" => oidc_client_id = args.next(),
@@ -78,6 +86,11 @@ fn main() -> ExitCode {
             _ => return usage(),
         }
     }
+    let quic = match (quic_listen, quic_cert, quic_key) {
+        (Some(addr), Some(cert), Some(key)) => Some((addr, cert, key)),
+        (None, None, None) => None,
+        _ => return usage(),
+    };
     let (activation, session_fds) = activation_fds();
     if listen.is_none() && activation.is_none() {
         return usage();
@@ -121,6 +134,10 @@ fn main() -> ExitCode {
         };
         if let Some(timeout) = session_timeout {
             server.set_session_timeout(timeout);
+        }
+        if let Some((addr, cert, key)) = &quic {
+            let addr = addr.parse().map_err(std::io::Error::other)?;
+            server.enable_quic(addr, Path::new(cert), Path::new(key))?;
         }
         // Set by systemd for RuntimeDirectory=; gives forwarded agent sockets
         // a stable path that survives daemon restarts and holds the state of

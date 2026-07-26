@@ -14,19 +14,19 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use herdr_eternal_proto as proto;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::net::unix::pipe;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 mod agent;
 mod auth;
+mod channel;
+mod quic;
 pub use auth::{Auth, AuthError, OidcConfig};
+use channel::{Channel, Event};
 #[cfg(feature = "test-util")]
 pub mod test_oidc;
 
@@ -57,6 +57,8 @@ const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 pub struct Server {
     listener: TcpListener,
+    /// Optional direct QUIC listener (the WebSocket path stays behind nginx).
+    quic: Option<quinn::Endpoint>,
     auth: Arc<Auth>,
     shell: String,
     sessions: SessionRegistry,
@@ -92,6 +94,7 @@ impl Server {
         info!(addr = %listener.local_addr()?, "listening");
         Ok(Self {
             listener,
+            quic: None,
             auth: Arc::new(auth),
             shell,
             sessions: SessionRegistry::default(),
@@ -123,6 +126,25 @@ impl Server {
         Ok(self.listener.local_addr()?)
     }
 
+    /// Additionally accepts direct QUIC connections on `addr`, terminating
+    /// TLS with the given PEM certificate chain and key (nginx cannot proxy
+    /// QUIC for us). Roaming clients benefit from QUIC connection migration.
+    pub fn enable_quic(
+        &mut self,
+        addr: std::net::SocketAddr,
+        cert_pem: &Path,
+        key_pem: &Path,
+    ) -> Result<(), ServerError> {
+        let endpoint = quic::listen(addr, cert_pem, key_pem)?;
+        info!(addr = %endpoint.local_addr()?, "listening (quic)");
+        self.quic = Some(endpoint);
+        Ok(())
+    }
+
+    pub fn quic_addr(&self) -> Option<std::net::SocketAddr> {
+        self.quic.as_ref().and_then(|ep| ep.local_addr().ok())
+    }
+
     pub async fn run(self) -> Result<(), ServerError> {
         Arc::new(self).serve().await
     }
@@ -131,6 +153,9 @@ impl Server {
     /// to the systemd fd store so the next daemon instance can resume them.
     pub async fn serve(self: Arc<Self>) -> Result<(), ServerError> {
         tokio::spawn(expire_sessions(self.sessions.clone(), self.session_timeout));
+        if self.quic.is_some() {
+            tokio::spawn(Arc::clone(&self).serve_quic());
+        }
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         loop {
@@ -139,19 +164,56 @@ impl Server {
                 _ = sigterm.recv() => return self.shut_down().await,
             };
             let (stream, peer) = accepted?;
-            let auth = Arc::clone(&self.auth);
-            let shell = self.shell.clone();
-            let sessions = self.sessions.clone();
-            let agent = self.agent.clone();
-            let session_env = Arc::clone(&self.session_env);
+            let server = Arc::clone(&self);
             tokio::spawn(async move {
-                if let Err(err) =
-                    handle_connection(stream, &auth, &shell, sessions, agent, &session_env).await
-                {
+                let channel = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(ws) => Channel::Ws(Box::new(ws)),
+                    Err(err) => {
+                        warn!(%peer, "websocket handshake failed: {err}");
+                        return;
+                    }
+                };
+                if let Err(err) = server.handle_channel(channel).await {
                     warn!(%peer, "connection failed: {err}");
                 }
             });
         }
+    }
+
+    /// Accepts QUIC connections; each carries one bidirectional stream that
+    /// speaks the same protocol as a WebSocket connection.
+    async fn serve_quic(self: Arc<Self>) {
+        let endpoint = self.quic.clone().expect("serve_quic requires an endpoint");
+        while let Some(incoming) = endpoint.accept().await {
+            let server = Arc::clone(&self);
+            tokio::spawn(async move {
+                let channel = async {
+                    let connection = incoming.await?;
+                    let (send, recv) = connection.accept_bi().await?;
+                    Ok::<_, quinn::ConnectionError>(Channel::Quic { send, recv })
+                };
+                match channel.await {
+                    Ok(channel) => {
+                        if let Err(err) = server.handle_channel(channel).await {
+                            warn!("quic connection failed: {err}");
+                        }
+                    }
+                    Err(err) => warn!("quic handshake failed: {err}"),
+                }
+            });
+        }
+    }
+
+    async fn handle_channel(&self, channel: Channel) -> Result<(), ServerError> {
+        handle_connection(
+            channel,
+            &self.auth,
+            &self.shell,
+            self.sessions.clone(),
+            self.agent.clone(),
+            &self.session_env,
+        )
+        .await
     }
 
     /// Pushes the fds of every resumable session into the systemd fd store so
@@ -494,32 +556,26 @@ fn new_resume_token() -> String {
 }
 
 async fn handle_connection(
-    stream: TcpStream,
+    mut channel: Channel,
     auth: &Auth,
     shell: &str,
     sessions: SessionRegistry,
     agent: agent::SharedAgentHub,
     session_env: &[(String, String)],
 ) -> Result<(), ServerError> {
-    let mut ws = tokio_tungstenite::accept_async(stream)
-        .await
-        .map_err(Box::new)?;
-
-    let hello: proto::Hello = recv(&mut ws).await?;
+    let hello: proto::Hello = channel.recv().await?;
     if let Err(err) = auth.verify(&hello.token).await {
-        ws.close(None).await.ok();
+        channel.close().await;
         return Err(err.into());
     }
-    send(
-        &mut ws,
-        &proto::Welcome {
+    channel
+        .send(&proto::Welcome {
             user: std::env::var("USER").unwrap_or_default(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-    )
-    .await?;
+        })
+        .await?;
 
-    let (session_token, session, last_seq_seen) = match recv(&mut ws).await? {
+    let (session_token, session, last_seq_seen) = match channel.recv().await? {
         proto::ExecRequest::Exec {
             command,
             resumable,
@@ -538,7 +594,7 @@ async fn handle_connection(
         } => {
             debug!(%resume_token, last_seq_seen, "resume");
             let Some(session) = sessions.get(&resume_token) else {
-                ws.close(None).await.ok();
+                channel.close().await;
                 return Err(ServerError::UnknownResumeToken);
             };
             (resume_token, session, last_seq_seen)
@@ -546,21 +602,21 @@ async fn handle_connection(
         proto::ExecRequest::AgentChannel { resume_token } => {
             debug!(%resume_token, "agent channel");
             let Some(session) = sessions.get(&resume_token) else {
-                ws.close(None).await.ok();
+                channel.close().await;
                 return Err(ServerError::UnknownResumeToken);
             };
             let Some(hub) = session.agent.clone() else {
-                ws.close(None).await.ok();
+                channel.close().await;
                 return Err(ServerError::AgentNotEnabled);
             };
             // Keep the session attached while its agent channel is, so it is
             // not expired away underneath a purely idle (but connected) client.
             let _attached = AttachGuard::new(session);
-            return agent::handle_agent_channel(ws, hub).await;
+            return agent::handle_agent_channel(channel, hub).await;
         }
     };
 
-    attach(ws, &sessions, &session_token, session, last_seq_seen).await
+    attach(channel, &sessions, &session_token, session, last_seq_seen).await
 }
 
 /// Gives the command a login-like environment, the way sshd does: identity
@@ -854,20 +910,18 @@ async fn session_task(
 /// Streams the session's outbound log to this connection (starting after
 /// `sent_up_to`) and forwards its inbound messages to the session.
 async fn attach(
-    mut ws: WebSocketStream<TcpStream>,
+    mut channel: Channel,
     sessions: &SessionRegistry,
     session_token: &str,
     session: Arc<Session>,
     mut sent_up_to: u64,
 ) -> Result<(), ServerError> {
     let _attached = AttachGuard::new(Arc::clone(&session));
-    send(
-        &mut ws,
-        &proto::ChannelMessage::Started {
+    channel
+        .send(&proto::ChannelMessage::Started {
             resume_token: session.resumable.then(|| session_token.to_string()),
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     // Detects clients that vanished without closing the connection (NAT
     // timeout, suspend): ping regularly and give up when nothing comes back.
@@ -889,18 +943,20 @@ async fn attach(
             if let proto::ChannelMessage::Exit { seq, .. } = message {
                 exit_seq = Some(seq);
             }
-            send(&mut ws, &message).await?;
+            channel.send(&message).await?;
             sent_up_to += 1;
         }
 
         let stdin_applied = session.stdin_applied.load(Ordering::Relaxed);
         if stdin_applied > acked_stdin {
             acked_stdin = stdin_applied;
-            send(&mut ws, &proto::ChannelMessage::Ack { seq: acked_stdin }).await?;
+            channel
+                .send(&proto::ChannelMessage::Ack { seq: acked_stdin })
+                .await?;
         }
 
         tokio::select! {
-            _ = keepalive.tick() => {
+            _ = keepalive.tick(), if channel.needs_ping() => {
                 if last_activity.elapsed() >= KEEPALIVE_TIMEOUT {
                     if !session.resumable {
                         sessions.remove(session_token);
@@ -908,27 +964,27 @@ async fn attach(
                     }
                     return Ok(());
                 }
-                ws.send(Message::Ping(Vec::new())).await.map_err(Box::new)?;
+                channel.ping().await?;
             }
             changed = latest.changed(), if exit_seq.is_none() => {
                 if changed.is_err() && session.log.after(sent_up_to).is_empty() {
                     // Session task ended without an Exit message.
                     sessions.remove(session_token);
-                    ws.close(None).await.ok();
+                    channel.close().await;
                     return Err(ServerError::SessionAborted);
                 }
             }
-            message = ws.next() => {
+            event = channel.next() => {
                 last_activity = tokio::time::Instant::now();
-                match message {
-                    Some(Ok(Message::Binary(bytes))) => {
+                match event {
+                    Event::Frame(bytes) => {
                         match proto::decode(&bytes)? {
                             proto::ChannelMessage::Ack { seq } => {
                                 session.log.trim(seq);
                                 if exit_seq.is_some_and(|exit| seq >= exit) {
                                     // Exit delivered; the session is complete.
                                     sessions.remove(session_token);
-                                    ws.close(None).await.ok();
+                                    channel.close().await;
                                     return Ok(());
                                 }
                             }
@@ -937,46 +993,22 @@ async fn attach(
                             }
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => {
+                    Event::Closed => {
                         if !session.resumable {
                             sessions.remove(session_token);
                             session.inbound.send(SessionInput::Abort).ok();
                         }
                         return Ok(());
                     }
-                    Some(Ok(_)) => {}
-                    Some(Err(err)) => {
+                    Event::Failed(err) => {
                         if !session.resumable {
                             sessions.remove(session_token);
                             session.inbound.send(SessionInput::Abort).ok();
                         }
-                        return Err(Box::new(err).into());
+                        return Err(err);
                     }
                 }
             }
-        }
-    }
-}
-
-async fn send<T: serde::Serialize>(
-    ws: &mut WebSocketStream<TcpStream>,
-    msg: &T,
-) -> Result<(), ServerError> {
-    ws.send(Message::Binary(proto::encode(msg)?))
-        .await
-        .map_err(Box::new)?;
-    Ok(())
-}
-
-async fn recv<T: serde::de::DeserializeOwned>(
-    ws: &mut WebSocketStream<TcpStream>,
-) -> Result<T, ServerError> {
-    loop {
-        match ws.next().await {
-            Some(Ok(Message::Binary(bytes))) => return Ok(proto::decode(&bytes)?),
-            Some(Ok(Message::Close(_))) | None => return Err(ServerError::HandshakeClosed),
-            Some(Ok(_)) => continue,
-            Some(Err(err)) => return Err(Box::new(err).into()),
         }
     }
 }

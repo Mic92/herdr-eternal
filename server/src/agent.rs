@@ -17,13 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use herdr_eternal_proto as proto;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixListener, UnixStream};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 
 use crate::ServerError;
@@ -188,7 +185,7 @@ async fn relay_agent_stream(hub: Arc<AgentHub>, stream: UnixStream) {
 
 /// Runs a connection that became the session's agent channel.
 pub(crate) async fn handle_agent_channel(
-    mut ws: WebSocketStream<TcpStream>,
+    mut channel: crate::Channel,
     hub: Arc<AgentHub>,
 ) -> Result<(), ServerError> {
     let (channel_tx, mut channel_rx) = mpsc::unbounded_channel();
@@ -200,11 +197,11 @@ pub(crate) async fn handle_agent_channel(
                 outbound = channel_rx.recv() => {
                     // The hub holds a sender, so recv() cannot return None here.
                     let Some(message) = outbound else { return Ok(()) };
-                    ws.send(Message::Binary(proto::encode(&message)?)).await.map_err(Box::new)?;
+                    channel.send(&message).await?;
                 }
-                message = ws.next() => {
-                    match message {
-                        Some(Ok(Message::Binary(bytes))) => match proto::decode(&bytes)? {
+                event = channel.next() => {
+                    match event {
+                        crate::Event::Frame(bytes) => match proto::decode(&bytes)? {
                             proto::ChannelMessage::AgentData { id, data } => {
                                 if let Some(stream) = hub.streams.lock().unwrap().get(&id) {
                                     stream.send(data).ok();
@@ -215,9 +212,8 @@ pub(crate) async fn handle_agent_channel(
                             }
                             other => debug!(?other, "ignoring message on agent channel"),
                         },
-                        Some(Ok(Message::Close(_))) | None => return Ok(()),
-                        Some(Ok(_)) => {}
-                        Some(Err(err)) => return Err(ServerError::WebSocket(Box::new(err))),
+                        crate::Event::Closed => return Ok(()),
+                        crate::Event::Failed(err) => return Err(err),
                     }
                 }
             }
