@@ -5,11 +5,7 @@
 
 use std::process::ExitCode;
 
-#[derive(Debug, thiserror::Error)]
-enum ClientError {
-    #[error("usage: herdr-eternal-ssh [ssh options] -T <target> [command]")]
-    Usage,
-}
+use herdr_eternal_ssh::{default_config_path, load_target, run_exec, ClientError};
 
 /// The subset of ssh's command line that herdr emits.
 #[derive(Debug, PartialEq, Eq)]
@@ -18,7 +14,7 @@ struct SshArgs {
     command: Option<String>,
 }
 
-fn parse_ssh_args<I: IntoIterator<Item = String>>(args: I) -> Result<SshArgs, ClientError> {
+fn parse_ssh_args<I: IntoIterator<Item = String>>(args: I) -> Option<SshArgs> {
     let mut args = args.into_iter();
     let mut target = None;
     let mut command_parts = Vec::new();
@@ -35,13 +31,14 @@ fn parse_ssh_args<I: IntoIterator<Item = String>>(args: I) -> Result<SshArgs, Cl
         }
     }
 
-    let target = target.ok_or(ClientError::Usage)?;
-    let command = if command_parts.is_empty() {
-        None
-    } else {
-        Some(command_parts.join(" "))
-    };
-    Ok(SshArgs { target, command })
+    Some(SshArgs {
+        target: target?,
+        command: if command_parts.is_empty() {
+            None
+        } else {
+            Some(command_parts.join(" "))
+        },
+    })
 }
 
 fn main() -> ExitCode {
@@ -52,17 +49,34 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    if let Err(err) = run() {
-        eprintln!("herdr-eternal-ssh: {err}");
+    let Some(args) = parse_ssh_args(std::env::args().skip(1)) else {
+        eprintln!("usage: herdr-eternal-ssh [ssh options] -T <target> <command>");
         return ExitCode::FAILURE;
+    };
+    let Some(command) = args.command else {
+        eprintln!("herdr-eternal-ssh: interactive shells are not supported, pass a command");
+        return ExitCode::FAILURE;
+    };
+
+    match run(&args.target, &command) {
+        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Err(err) => {
+            eprintln!("herdr-eternal-ssh: {err}");
+            ExitCode::FAILURE
+        }
     }
-    ExitCode::SUCCESS
 }
 
-fn run() -> Result<(), ClientError> {
-    let args = parse_ssh_args(std::env::args().skip(1))?;
-    tracing::debug!(?args, "parsed ssh arguments");
-    todo!("M1: WebSocket exec channel");
+fn run(target: &str, command: &str) -> Result<i32, ClientError> {
+    let target = load_target(&default_config_path(), target)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(run_exec(
+        &target,
+        command,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        tokio::io::stderr(),
+    ))
 }
 
 #[cfg(test)]
@@ -106,10 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_target_is_usage_error() {
-        assert!(matches!(
-            parse_ssh_args(args(&["-T"])),
-            Err(ClientError::Usage)
-        ));
+    fn missing_target_is_rejected() {
+        assert_eq!(parse_ssh_args(args(&["-T"])), None);
     }
 }
