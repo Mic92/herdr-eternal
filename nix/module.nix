@@ -60,12 +60,6 @@ in
       };
     };
 
-    shell = lib.mkOption {
-      type = lib.types.str;
-      default = "/run/current-system/sw/bin/bash";
-      description = "Shell used to run exec commands (`shell -c`, like sshd).";
-    };
-
     nginx = {
       enable = lib.mkEnableOption "an nginx location proxying WebSocket traffic to the server";
 
@@ -98,7 +92,6 @@ in
       description = "Roaming-friendly transport for herdr --remote";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
-      environment.SHELL = cfg.shell;
       serviceConfig = {
         ExecStart = lib.concatStringsSep " " (
           [

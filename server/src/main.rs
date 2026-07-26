@@ -17,6 +17,16 @@ fn usage() -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// The user's login shell from the passwd database, like sshd uses.
+fn login_shell() -> String {
+    nix::unistd::User::from_uid(nix::unistd::getuid())
+        .ok()
+        .flatten()
+        .map(|user| user.shell.to_string_lossy().into_owned())
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -72,7 +82,7 @@ fn main() -> ExitCode {
         Some(Err(_)) => return usage(),
         None => None,
     };
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let shell = login_shell();
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = runtime.block_on(async {

@@ -324,6 +324,8 @@ fn start_session(
     let mut cmd = tokio::process::Command::new(shell);
     cmd.arg("-c")
         .arg(command)
+        // Like sshd: programs in the session should see the login shell.
+        .env("SHELL", shell)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

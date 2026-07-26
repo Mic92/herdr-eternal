@@ -14,6 +14,9 @@ pkgs.testers.runNixOSTest {
       imports = [ nixosModule ];
 
       users.users.alice = {
+        # Not the default shell: exec commands and $SHELL must use the login
+        # shell from the passwd database, like sshd.
+        shell = pkgs.zsh;
         isNormalUser = true;
       };
 
@@ -43,7 +46,8 @@ pkgs.testers.runNixOSTest {
     )
 
     output = machine.succeed("herdr-eternal-ssh -T testbox 'id -un; echo $SHELL' < /dev/null")
-    assert output == "alice\n/run/current-system/sw/bin/bash\n", repr(output)
+    user, shell = output.splitlines()
+    assert user == "alice" and shell.endswith("/bin/zsh"), repr(output)
 
     # Exit codes must be propagated through nginx as well.
     machine.fail("herdr-eternal-ssh -T testbox 'exit 3' < /dev/null")
