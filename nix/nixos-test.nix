@@ -36,7 +36,10 @@ pkgs.testers.runNixOSTest {
       # Target for real ssh authentication through the forwarded agent.
       services.openssh.enable = true;
 
-      environment.systemPackages = [ package ];
+      environment.systemPackages = [
+        package
+        pkgs.curl
+      ];
     };
 
   testScript = ''
@@ -49,9 +52,16 @@ pkgs.testers.runNixOSTest {
         "printf '[targets.testbox]\nurl = \"ws://localhost/herdr-eternal\"\ntoken = \"test-token\"\nforward_agent = true\n' > /root/.config/herdr-eternal/config.toml",
     )
 
-    output = machine.succeed("herdr-eternal-ssh -T testbox 'id -un; echo $SHELL' < /dev/null")
-    user, shell = output.splitlines()
-    assert user == "alice" and shell.endswith("/bin/zsh"), repr(output)
+    # Sessions get a login-like environment: identity from passwd, a working
+    # PATH, and no systemd internals from the daemon.
+    output = machine.succeed(
+        "herdr-eternal-ssh -T testbox "
+        "'id -un; echo $SHELL; echo $USER; echo $LOGNAME; echo $HOME; "
+        "curl --version > /dev/null && echo curl-ok; echo systemd=$RUNTIME_DIRECTORY$LISTEN_FDS$INVOCATION_ID' < /dev/null"
+    )
+    lines = output.splitlines()
+    assert lines[0] == "alice" and lines[1].endswith("/bin/zsh"), repr(output)
+    assert lines[2:] == ["alice", "alice", "/home/alice", "curl-ok", "systemd="], repr(output)
 
     # Exit codes must be propagated through nginx as well.
     machine.fail("herdr-eternal-ssh -T testbox 'exit 3' < /dev/null")

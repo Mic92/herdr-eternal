@@ -324,6 +324,30 @@ async fn handle_connection(
     attach(ws, &sessions, &session_token, session, last_seq_seen).await
 }
 
+/// Gives the command a login-like environment, the way sshd does: identity
+/// and shell from the passwd database, PATH and locale carried over, and
+/// nothing else, so daemon internals (systemd variables, credentials paths)
+/// do not leak into sessions. Everything further comes from the shell's own
+/// startup files.
+fn session_environment(cmd: &mut tokio::process::Command, shell: &str) {
+    cmd.env_clear();
+    cmd.env("SHELL", shell);
+    cmd.env(
+        "PATH",
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+    );
+    if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::getuid()) {
+        cmd.env("USER", &user.name);
+        cmd.env("LOGNAME", &user.name);
+        cmd.env("HOME", &user.dir);
+    }
+    for (key, value) in std::env::vars() {
+        if key == "LANG" || key == "TZ" || key.starts_with("LC_") {
+            cmd.env(key, value);
+        }
+    }
+}
+
 /// Spawns the child and the session task that owns it.
 fn start_session(
     shell: &str,
@@ -334,11 +358,10 @@ fn start_session(
     let mut cmd = tokio::process::Command::new(shell);
     cmd.arg("-c")
         .arg(command)
-        // Like sshd: programs in the session should see the login shell.
-        .env("SHELL", shell)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    session_environment(&mut cmd, shell);
     if let Some(agent) = &agent {
         cmd.env("SSH_AUTH_SOCK", agent.socket_path());
     }
