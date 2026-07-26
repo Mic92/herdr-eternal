@@ -92,17 +92,3 @@ $ nix develop
 $ cargo test --workspace
 $ nix flake check   # clippy, tests (incl. patched-herdr e2e), NixOS VM test
 ```
-
-## Status / roadmap
-
-- [x] Exec channels with framed stdio and exit codes
-- [x] Byte-exact resume after connection loss (client retries for 60s)
-- [x] End-to-end test driving a patched `herdr --remote`
-- [x] NixOS module + nginx integration + VM test
-- [x] OIDC device-code login as an alternative to pre-shared tokens
-- [x] Bounded replay buffers, session expiry, keepalives for silent drops
-- [x] Opt-in SSH agent forwarding (`forward_agent`)
-- [x] sshd-like sessions: login shell from passwd, clean login environment
-- [x] Socket activation and readiness notification (no accept gap on restart)
-- [x] Sessions survive daemon restarts (systemd fd store handover)
-- [x] Optional QUIC direct path (connection migration), WebSocket fallback
