@@ -13,9 +13,10 @@ pkgs.testers.runNixOSTest {
     {
       imports = [ nixosModule ];
 
+      # Not the default shell: exec commands and $SHELL must use the login
+      # shell from the passwd database, like sshd.
+      programs.zsh.enable = true;
       users.users.alice = {
-        # Not the default shell: exec commands and $SHELL must use the login
-        # shell from the passwd database, like sshd.
         shell = pkgs.zsh;
         isNormalUser = true;
       };

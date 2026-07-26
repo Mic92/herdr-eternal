@@ -93,6 +93,9 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
       serviceConfig = {
+        # Stable location for the forwarded SSH agent socket.
+        RuntimeDirectory = "herdr-eternal-server";
+        RuntimeDirectoryMode = "0700";
         ExecStart = lib.concatStringsSep " " (
           [
             (lib.getExe' cfg.package "herdr-eternal-server")

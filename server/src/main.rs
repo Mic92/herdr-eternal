@@ -90,6 +90,11 @@ fn main() -> ExitCode {
         if let Some(timeout) = session_timeout {
             server.set_session_timeout(timeout);
         }
+        // Set by systemd for RuntimeDirectory=; gives forwarded agent sockets
+        // a stable path that survives daemon restarts.
+        if let Some(dir) = std::env::var_os("RUNTIME_DIRECTORY") {
+            server.set_agent_runtime_dir(dir.into());
+        }
         server.run().await
     });
     match result {

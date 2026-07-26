@@ -58,6 +58,7 @@ pub struct Server {
     shell: String,
     sessions: SessionRegistry,
     session_timeout: Duration,
+    agent: agent::SharedAgentHub,
 }
 
 impl Server {
@@ -70,11 +71,19 @@ impl Server {
             shell,
             sessions: SessionRegistry::default(),
             session_timeout: DEFAULT_SESSION_TIMEOUT,
+            agent: agent::SharedAgentHub::default(),
         })
     }
 
     pub fn set_session_timeout(&mut self, timeout: Duration) {
         self.session_timeout = timeout;
+    }
+
+    /// Puts the forwarded agent socket at a stable path in `dir` (instead of
+    /// a per-server temporary directory), so long-lived programs inside
+    /// sessions keep a working `SSH_AUTH_SOCK` across daemon restarts.
+    pub fn set_agent_runtime_dir(&mut self, dir: std::path::PathBuf) {
+        self.agent = agent::SharedAgentHub::new(Some(dir));
     }
 
     pub fn local_addr(&self) -> Result<std::net::SocketAddr, ServerError> {
@@ -88,8 +97,9 @@ impl Server {
             let auth = Arc::clone(&self.auth);
             let shell = self.shell.clone();
             let sessions = self.sessions.clone();
+            let agent = self.agent.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_connection(stream, &auth, &shell, sessions).await {
+                if let Err(err) = handle_connection(stream, &auth, &shell, sessions, agent).await {
                     warn!(%peer, "connection failed: {err}");
                 }
             });
@@ -250,6 +260,7 @@ async fn handle_connection(
     auth: &Auth,
     shell: &str,
     sessions: SessionRegistry,
+    agent: agent::SharedAgentHub,
 ) -> Result<(), ServerError> {
     let mut ws = tokio_tungstenite::accept_async(stream)
         .await
@@ -276,7 +287,10 @@ async fn handle_connection(
             forward_agent,
         } => {
             debug!(%command, resumable, forward_agent, "exec");
-            let session = start_session(shell, &command, resumable, forward_agent)?;
+            let agent = forward_agent
+                .then(|| agent.get_or_start())
+                .transpose()?;
+            let session = start_session(shell, &command, resumable, agent)?;
             let session_token = new_resume_token();
             sessions.insert(session_token.clone(), Arc::clone(&session));
             (session_token, session, 0)
@@ -317,10 +331,8 @@ fn start_session(
     shell: &str,
     command: &str,
     resumable: bool,
-    forward_agent: bool,
+    agent: Option<Arc<agent::AgentHub>>,
 ) -> Result<Arc<Session>, ServerError> {
-    let agent = forward_agent.then(agent::AgentHub::start).transpose()?;
-
     let mut cmd = tokio::process::Command::new(shell);
     cmd.arg("-c")
         .arg(command)

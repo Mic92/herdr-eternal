@@ -5,6 +5,11 @@
 //! relayed as `AgentOpen`/`AgentData`/`AgentClose` messages over a dedicated
 //! agent channel (a separate WebSocket connection the client attaches with
 //! `ExecRequest::AgentChannel`), where the client dials its local agent.
+//!
+//! There is one hub per server process and its socket path is stable when a
+//! runtime directory is configured, so long-lived programs started inside a
+//! session (like a herdr server) keep a working `SSH_AUTH_SOCK` across
+//! reconnects; requests always go to the most recently attached client.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +30,31 @@ use crate::ServerError;
 
 type ChannelSender = mpsc::UnboundedSender<proto::ChannelMessage>;
 
+/// The server's single, lazily created [`AgentHub`].
+#[derive(Clone, Default)]
+pub(crate) struct SharedAgentHub {
+    runtime_dir: Option<PathBuf>,
+    hub: Arc<Mutex<Option<Arc<AgentHub>>>>,
+}
+
+impl SharedAgentHub {
+    /// With a runtime directory the agent socket gets a stable path there.
+    pub(crate) fn new(runtime_dir: Option<PathBuf>) -> Self {
+        Self {
+            runtime_dir,
+            hub: Arc::default(),
+        }
+    }
+
+    pub(crate) fn get_or_start(&self) -> Result<Arc<AgentHub>, ServerError> {
+        let mut hub = self.hub.lock().unwrap();
+        if hub.is_none() {
+            *hub = Some(AgentHub::start(self.runtime_dir.as_deref())?);
+        }
+        Ok(Arc::clone(hub.as_ref().expect("hub was just created")))
+    }
+}
+
 /// How long an agent connection waits for an agent channel to attach. Right
 /// after the exec starts, programs like ssh-add race the client's separate
 /// agent-channel connection.
@@ -34,8 +64,9 @@ const CHANNEL_WAIT: Duration = Duration::from_secs(5);
 /// agent channel is currently attached.
 pub(crate) struct AgentHub {
     socket_path: PathBuf,
-    /// Keeps the private (0700) socket directory alive as long as the hub.
-    _dir: tempfile::TempDir,
+    /// Keeps the private (0700) fallback socket directory alive as long as
+    /// the hub; `None` when a stable runtime directory is used instead.
+    _dir: Option<tempfile::TempDir>,
     /// Sender towards the currently attached agent channel, if any.
     channel: watch::Sender<Option<ChannelSender>>,
     /// Write halves of open agent connections, by stream id.
@@ -44,12 +75,27 @@ pub(crate) struct AgentHub {
 }
 
 impl AgentHub {
-    /// Creates the agent socket and starts accepting connections on it.
-    pub(crate) fn start() -> Result<Arc<Self>, ServerError> {
-        let dir = tempfile::Builder::new()
-            .prefix("herdr-eternal-agent")
-            .tempdir()?;
-        let socket_path = dir.path().join("agent.sock");
+    /// Creates the agent socket and starts accepting connections on it. With
+    /// `runtime_dir` the socket lives at a stable `<dir>/agent.sock`,
+    /// otherwise in a private temporary directory.
+    pub(crate) fn start(runtime_dir: Option<&Path>) -> Result<Arc<Self>, ServerError> {
+        let (dir, socket_path) = match runtime_dir {
+            Some(runtime_dir) => {
+                let socket_path = runtime_dir.join("agent.sock");
+                // Left over from a previous run; bind() refuses existing paths.
+                if socket_path.exists() {
+                    std::fs::remove_file(&socket_path)?;
+                }
+                (None, socket_path)
+            }
+            None => {
+                let dir = tempfile::Builder::new()
+                    .prefix("herdr-eternal-agent")
+                    .tempdir()?;
+                let socket_path = dir.path().join("agent.sock");
+                (Some(dir), socket_path)
+            }
+        };
         let listener = UnixListener::bind(&socket_path)?;
         let hub = Arc::new(Self {
             socket_path,
