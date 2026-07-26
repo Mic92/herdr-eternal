@@ -10,17 +10,25 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use herdr_eternal_proto as proto;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 
 use crate::ServerError;
+
+type ChannelSender = mpsc::UnboundedSender<proto::ChannelMessage>;
+
+/// How long an agent connection waits for an agent channel to attach. Right
+/// after the exec starts, programs like ssh-add race the client's separate
+/// agent-channel connection.
+const CHANNEL_WAIT: Duration = Duration::from_secs(5);
 
 /// Relays connections to the session's forwarded agent socket to whichever
 /// agent channel is currently attached.
@@ -29,7 +37,7 @@ pub(crate) struct AgentHub {
     /// Keeps the private (0700) socket directory alive as long as the hub.
     _dir: tempfile::TempDir,
     /// Sender towards the currently attached agent channel, if any.
-    channel: Mutex<Option<mpsc::UnboundedSender<proto::ChannelMessage>>>,
+    channel: watch::Sender<Option<ChannelSender>>,
     /// Write halves of open agent connections, by stream id.
     streams: Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>>,
     next_id: AtomicU64,
@@ -46,7 +54,7 @@ impl AgentHub {
         let hub = Arc::new(Self {
             socket_path,
             _dir: dir,
-            channel: Mutex::new(None),
+            channel: watch::Sender::new(None),
             streams: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         });
@@ -59,10 +67,18 @@ impl AgentHub {
     }
 
     fn send_to_channel(&self, message: proto::ChannelMessage) -> bool {
-        match self.channel.lock().unwrap().as_ref() {
+        match self.channel.borrow().as_ref() {
             Some(channel) => channel.send(message).is_ok(),
             None => false,
         }
+    }
+
+    /// Waits (bounded) until an agent channel is attached.
+    async fn channel_attached(&self) -> bool {
+        let mut channel = self.channel.subscribe();
+        tokio::time::timeout(CHANNEL_WAIT, channel.wait_for(Option::is_some))
+            .await
+            .is_ok_and(|attached| attached.is_ok())
     }
 }
 
@@ -71,27 +87,27 @@ async fn accept_agent_connections(hub: Arc<AgentHub>, listener: UnixListener) {
         let Ok((stream, _)) = listener.accept().await else {
             return;
         };
-        let id = hub.next_id.fetch_add(1, Ordering::Relaxed);
-        let (write_tx, write_rx) = mpsc::unbounded_channel();
-        hub.streams.lock().unwrap().insert(id, write_tx);
-        // Without an attached client there is nobody to answer; failing the
-        // connection immediately mirrors ssh when the agent is gone.
-        if !hub.send_to_channel(proto::ChannelMessage::AgentOpen { id }) {
-            hub.streams.lock().unwrap().remove(&id);
-            continue;
-        }
-        tokio::spawn(relay_agent_stream(Arc::clone(&hub), id, stream, write_rx));
+        tokio::spawn(relay_agent_stream(Arc::clone(&hub), stream));
     }
 }
 
 /// Pumps one accepted agent connection: local reads become `AgentData`
 /// towards the client, and `AgentData` from the client is written back.
-async fn relay_agent_stream(
-    hub: Arc<AgentHub>,
-    id: u64,
-    stream: UnixStream,
-    mut write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-) {
+async fn relay_agent_stream(hub: Arc<AgentHub>, stream: UnixStream) {
+    // Without an attached client there is nobody to answer; give a fresh
+    // reconnect a moment, then fail the connection like ssh does when the
+    // agent is gone.
+    if !hub.channel_attached().await {
+        return;
+    }
+    let id = hub.next_id.fetch_add(1, Ordering::Relaxed);
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+    hub.streams.lock().unwrap().insert(id, write_tx);
+    if !hub.send_to_channel(proto::ChannelMessage::AgentOpen { id }) {
+        hub.streams.lock().unwrap().remove(&id);
+        return;
+    }
+
     let (mut reader, mut writer) = stream.into_split();
     let mut buffer = [0_u8; 4096];
     loop {
@@ -130,7 +146,7 @@ pub(crate) async fn handle_agent_channel(
     hub: Arc<AgentHub>,
 ) -> Result<(), ServerError> {
     let (channel_tx, mut channel_rx) = mpsc::unbounded_channel();
-    *hub.channel.lock().unwrap() = Some(channel_tx.clone());
+    hub.channel.send_replace(Some(channel_tx.clone()));
 
     let result: Result<(), ServerError> = async {
         loop {
@@ -164,12 +180,14 @@ pub(crate) async fn handle_agent_channel(
     .await;
 
     // Only detach if a reconnected agent channel has not replaced us already.
-    let mut channel = hub.channel.lock().unwrap();
-    if channel
-        .as_ref()
-        .is_some_and(|current| current.same_channel(&channel_tx))
-    {
-        *channel = None;
-    }
+    hub.channel.send_if_modified(|channel| {
+        let ours = channel
+            .as_ref()
+            .is_some_and(|current| current.same_channel(&channel_tx));
+        if ours {
+            *channel = None;
+        }
+        ours
+    });
     result
 }
