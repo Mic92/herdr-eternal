@@ -2,7 +2,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use herdr_eternal_proto as proto;
-use herdr_eternal_server::Server;
+use herdr_eternal_server::{Auth, Server};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -10,9 +10,13 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn start_server() -> Ws {
-    let server = Server::bind("127.0.0.1:0", "secret".into(), "/bin/sh".into())
-        .await
-        .unwrap();
+    let server = Server::bind(
+        "127.0.0.1:0",
+        Auth::static_token("secret".into()),
+        "/bin/sh".into(),
+    )
+    .await
+    .unwrap();
     let addr = server.local_addr().unwrap();
     tokio::spawn(server.run());
     let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))

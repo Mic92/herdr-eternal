@@ -1,13 +1,17 @@
 //! End-to-end test: client library against the real server.
 
-use herdr_eternal_server::Server;
+use herdr_eternal_server::{Auth, Server};
 use herdr_eternal_ssh::{Target, run_exec};
 
 #[tokio::test]
 async fn exec_roundtrip_through_client_and_server() {
-    let server = Server::bind("127.0.0.1:0", "secret".into(), "/bin/sh".into())
-        .await
-        .unwrap();
+    let server = Server::bind(
+        "127.0.0.1:0",
+        Auth::static_token("secret".into()),
+        "/bin/sh".into(),
+    )
+    .await
+    .unwrap();
     let addr = server.local_addr().unwrap();
     tokio::spawn(server.run());
 

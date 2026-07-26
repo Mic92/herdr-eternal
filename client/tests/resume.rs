@@ -6,15 +6,19 @@ mod support;
 
 use std::time::Duration;
 
-use herdr_eternal_server::Server;
+use herdr_eternal_server::{Auth, Server};
 use herdr_eternal_ssh::{Target, run_exec};
 use support::proxy::FlakyProxy;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_survives_severed_connection() {
-    let server = Server::bind("127.0.0.1:0", "secret".into(), "/bin/sh".into())
-        .await
-        .unwrap();
+    let server = Server::bind(
+        "127.0.0.1:0",
+        Auth::static_token("secret".into()),
+        "/bin/sh".into(),
+    )
+    .await
+    .unwrap();
     let upstream = server.local_addr().unwrap();
     tokio::spawn(server.run());
     let proxy = FlakyProxy::start(upstream).await.unwrap();

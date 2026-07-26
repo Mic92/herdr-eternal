@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use herdr_eternal_server::Server;
+use herdr_eternal_server::{Auth, Server};
 
 fn herdr_available() -> bool {
     Command::new("herdr")
@@ -73,9 +73,13 @@ async fn herdr_remote_bootstraps_over_the_transport() {
         std::env::set_var(key, value);
     }
 
-    let server = Server::bind("127.0.0.1:0", "test-token".into(), "/bin/sh".into())
-        .await
-        .unwrap();
+    let server = Server::bind(
+        "127.0.0.1:0",
+        Auth::static_token("test-token".into()),
+        "/bin/sh".into(),
+    )
+    .await
+    .unwrap();
     let addr = server.local_addr().unwrap();
     tokio::spawn(server.run());
 

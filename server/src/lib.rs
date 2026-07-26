@@ -20,6 +20,11 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
+mod auth;
+pub use auth::{Auth, AuthError, OidcConfig};
+#[cfg(feature = "test-util")]
+pub mod test_oidc;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     #[error("io error: {0}")]
@@ -30,8 +35,8 @@ pub enum ServerError {
     Protocol(#[from] proto::ProtocolError),
     #[error("client closed the connection during handshake")]
     HandshakeClosed,
-    #[error("invalid authentication token")]
-    InvalidToken,
+    #[error("authentication failed: {0}")]
+    Auth(#[from] AuthError),
     #[error("unknown resume token")]
     UnknownResumeToken,
     #[error("session ended without an exit code")]
@@ -40,18 +45,18 @@ pub enum ServerError {
 
 pub struct Server {
     listener: TcpListener,
-    token: String,
+    auth: Arc<Auth>,
     shell: String,
     sessions: SessionRegistry,
 }
 
 impl Server {
-    pub async fn bind(addr: &str, token: String, shell: String) -> Result<Self, ServerError> {
+    pub async fn bind(addr: &str, auth: Auth, shell: String) -> Result<Self, ServerError> {
         let listener = TcpListener::bind(addr).await?;
         info!(addr = %listener.local_addr()?, "listening");
         Ok(Self {
             listener,
-            token,
+            auth: Arc::new(auth),
             shell,
             sessions: SessionRegistry::default(),
         })
@@ -64,11 +69,11 @@ impl Server {
     pub async fn run(self) -> Result<(), ServerError> {
         loop {
             let (stream, peer) = self.listener.accept().await?;
-            let token = self.token.clone();
+            let auth = Arc::clone(&self.auth);
             let shell = self.shell.clone();
             let sessions = self.sessions.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_connection(stream, &token, &shell, sessions).await {
+                if let Err(err) = handle_connection(stream, &auth, &shell, sessions).await {
                     warn!(%peer, "connection failed: {err}");
                 }
             });
@@ -146,7 +151,7 @@ fn new_resume_token() -> String {
 
 async fn handle_connection(
     stream: TcpStream,
-    token: &str,
+    auth: &Auth,
     shell: &str,
     sessions: SessionRegistry,
 ) -> Result<(), ServerError> {
@@ -155,9 +160,9 @@ async fn handle_connection(
         .map_err(Box::new)?;
 
     let hello: proto::Hello = recv(&mut ws).await?;
-    if hello.token != token {
+    if let Err(err) = auth.verify(&hello.token).await {
         ws.close(None).await.ok();
-        return Err(ServerError::InvalidToken);
+        return Err(err.into());
     }
     send(
         &mut ws,
