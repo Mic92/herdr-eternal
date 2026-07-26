@@ -179,6 +179,14 @@ async fn run_command(
                 seq += 1;
                 send(&mut ws, &proto::ChannelMessage::Exit { seq, code }).await?;
                 ws.close(None).await.ok();
+                // Drain until the peer closes: dropping the socket with unread
+                // client data (e.g. an unprocessed StdinEof) sends a TCP RST,
+                // which can discard the Exit frame before the client reads it.
+                while let Some(message) = ws.next().await {
+                    if message.is_err() {
+                        break;
+                    }
+                }
                 return Ok(());
             }
         }
