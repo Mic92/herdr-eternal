@@ -114,3 +114,68 @@ async fn wrong_token_is_rejected() {
         }
     }
 }
+
+/// A resumable session whose client crashed and never comes back must not
+/// keep its child process forever: after the session timeout the server
+/// forgets the resume token.
+#[tokio::test]
+async fn disconnected_session_expires_after_timeout() {
+    let mut server = Server::bind(
+        "127.0.0.1:0",
+        Auth::static_token("secret".into()),
+        "/bin/sh".into(),
+    )
+    .await
+    .unwrap();
+    server.set_session_timeout(std::time::Duration::from_millis(200));
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(server.run());
+
+    let connect = || async {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        send(&mut ws, &hello("secret")).await;
+        let _welcome: proto::Welcome = recv(&mut ws).await;
+        ws
+    };
+
+    // Start a long-running resumable exec, then vanish without closing.
+    let mut ws = connect().await;
+    send(
+        &mut ws,
+        &proto::ExecRequest::Exec {
+            command: "sleep 60".into(),
+            resumable: true,
+        },
+    )
+    .await;
+    let proto::ChannelMessage::Started {
+        resume_token: Some(resume_token),
+    } = recv(&mut ws).await
+    else {
+        panic!("expected a resumable session");
+    };
+    drop(ws);
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // The expired session cannot be resumed; the server closes the connection.
+    let mut ws = connect().await;
+    send(
+        &mut ws,
+        &proto::ExecRequest::Resume {
+            resume_token,
+            last_seq_seen: 0,
+        },
+    )
+    .await;
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Close(_))) | None => break,
+            Some(Ok(Message::Binary(_))) => panic!("server resumed an expired session"),
+            Some(Ok(_)) => continue,
+            Some(Err(_)) => break,
+        }
+    }
+}

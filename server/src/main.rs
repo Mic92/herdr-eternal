@@ -9,8 +9,10 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: herdr-eternal-server --listen <addr:port> [--token-file <path>]\n\
          \x20                          [--oidc-issuer <url> --oidc-client-id <id> --oidc-allowed-sub <sub>]\n\
+         \x20                          [--session-timeout-secs <secs>]\n\
          The token file contains the pre-shared token clients may present.\n\
-         With --oidc-* set, OIDC bearer tokens from that issuer are also accepted."
+         With --oidc-* set, OIDC bearer tokens from that issuer are also accepted.\n\
+         Disconnected sessions are killed after the session timeout (default 7 days)."
     );
     ExitCode::FAILURE
 }
@@ -27,6 +29,7 @@ fn main() -> ExitCode {
     let mut oidc_issuer = None;
     let mut oidc_client_id = None;
     let mut oidc_allowed_sub = None;
+    let mut session_timeout_secs = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -35,6 +38,7 @@ fn main() -> ExitCode {
             "--oidc-issuer" => oidc_issuer = args.next(),
             "--oidc-client-id" => oidc_client_id = args.next(),
             "--oidc-allowed-sub" => oidc_allowed_sub = args.next(),
+            "--session-timeout-secs" => session_timeout_secs = args.next(),
             _ => return usage(),
         }
     }
@@ -63,11 +67,19 @@ fn main() -> ExitCode {
     if static_token.is_none() && oidc.is_none() {
         return usage();
     }
+    let session_timeout = match session_timeout_secs.as_deref().map(str::parse::<u64>) {
+        Some(Ok(secs)) => Some(std::time::Duration::from_secs(secs)),
+        Some(Err(_)) => return usage(),
+        None => None,
+    };
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = runtime.block_on(async {
-        let server = Server::bind(&listen, Auth::new(static_token, oidc), shell).await?;
+        let mut server = Server::bind(&listen, Auth::new(static_token, oidc), shell).await?;
+        if let Some(timeout) = session_timeout {
+            server.set_session_timeout(timeout);
+        }
         server.run().await
     });
     match result {

@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,11 +44,17 @@ pub enum ServerError {
     SessionAborted,
 }
 
+/// How long a resumable session may stay disconnected before it is killed.
+/// Long enough that a suspended laptop can come back days later; bounded so
+/// a client that crashed for good does not leak a child process forever.
+const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 pub struct Server {
     listener: TcpListener,
     auth: Arc<Auth>,
     shell: String,
     sessions: SessionRegistry,
+    session_timeout: Duration,
 }
 
 impl Server {
@@ -60,7 +66,12 @@ impl Server {
             auth: Arc::new(auth),
             shell,
             sessions: SessionRegistry::default(),
+            session_timeout: DEFAULT_SESSION_TIMEOUT,
         })
+    }
+
+    pub fn set_session_timeout(&mut self, timeout: Duration) {
+        self.session_timeout = timeout;
     }
 
     pub fn local_addr(&self) -> Result<std::net::SocketAddr, ServerError> {
@@ -68,6 +79,7 @@ impl Server {
     }
 
     pub async fn run(self) -> Result<(), ServerError> {
+        tokio::spawn(expire_sessions(self.sessions.clone(), self.session_timeout));
         loop {
             let (stream, peer) = self.listener.accept().await?;
             let auth = Arc::clone(&self.auth);
@@ -139,7 +151,46 @@ struct Session {
     /// Highest stdin sequence number the session task has applied; reported
     /// back to the client so it can trim its resend buffer.
     stdin_applied: Arc<AtomicU64>,
+    /// Number of currently attached connections (a lingering blackholed
+    /// connection can overlap with its own resume).
+    attached: AtomicUsize,
+    /// When the last connection detached; `None` while a client is attached.
+    /// Drives the disconnected-session timeout.
+    detached_at: Mutex<Option<tokio::time::Instant>>,
     resumable: bool,
+}
+
+/// Marks the session as attached for its lifetime and records the detach
+/// time when the last connection goes away, whichever way `attach` returns.
+struct AttachGuard(Arc<Session>);
+
+impl AttachGuard {
+    fn new(session: Arc<Session>) -> Self {
+        session.attached.fetch_add(1, Ordering::SeqCst);
+        *session.detached_at.lock().unwrap() = None;
+        Self(session)
+    }
+}
+
+impl Drop for AttachGuard {
+    fn drop(&mut self) {
+        if self.0.attached.fetch_sub(1, Ordering::SeqCst) == 1 {
+            *self.0.detached_at.lock().unwrap() = Some(tokio::time::Instant::now());
+        }
+    }
+}
+
+/// Kills sessions whose client has been gone longer than `timeout`.
+async fn expire_sessions(sessions: SessionRegistry, timeout: Duration) {
+    let mut sweep = tokio::time::interval((timeout / 10).max(Duration::from_millis(10)));
+    loop {
+        sweep.tick().await;
+        for (token, session) in sessions.expired(timeout) {
+            info!(%token, "expiring disconnected session");
+            sessions.remove(&token);
+            session.inbound.send(SessionInput::Abort).ok();
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -156,6 +207,23 @@ impl SessionRegistry {
 
     fn remove(&self, token: &str) {
         self.0.lock().unwrap().remove(token);
+    }
+
+    /// Sessions that have had no attached connection for longer than `timeout`.
+    fn expired(&self, timeout: Duration) -> Vec<(String, Arc<Session>)> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, session)| {
+                session
+                    .detached_at
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|detached| detached.elapsed() >= timeout)
+            })
+            .map(|(token, session)| (token.clone(), Arc::clone(session)))
+            .collect()
     }
 }
 
@@ -237,6 +305,8 @@ fn start_session(shell: &str, command: &str, resumable: bool) -> Result<Arc<Sess
         inbound: inbound_tx,
         log: Arc::clone(&log),
         stdin_applied: Arc::clone(&stdin_applied),
+        attached: AtomicUsize::new(0),
+        detached_at: Mutex::new(Some(tokio::time::Instant::now())),
         resumable,
     });
 
@@ -352,6 +422,7 @@ async fn attach(
     session: Arc<Session>,
     mut sent_up_to: u64,
 ) -> Result<(), ServerError> {
+    let _attached = AttachGuard::new(Arc::clone(&session));
     send(
         &mut ws,
         &proto::ChannelMessage::Started {

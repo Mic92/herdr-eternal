@@ -23,7 +23,7 @@ async fn start_server_behind_proxy() -> FlakyProxy {
     FlakyProxy::start(upstream).await.unwrap()
 }
 
-/// Runs the counting script through the proxy and returns (code, stdout, stderr).
+/// Runs the slow counting script against `target`; returns (code, stdout, stderr).
 fn spawn_counting_exec(target: Target) -> tokio::task::JoinHandle<(i32, Vec<u8>, Vec<u8>)> {
     tokio::spawn(async move {
         // Slow, deterministic output so the netsplit hits mid-stream.
