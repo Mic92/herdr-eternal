@@ -59,6 +59,9 @@ pub struct Server {
     sessions: SessionRegistry,
     session_timeout: Duration,
     agent: agent::SharedAgentHub,
+    /// Extra variables applied on top of the sshd-like session environment;
+    /// tests use this to confine sessions to a scratch HOME.
+    session_env: Arc<Vec<(String, String)>>,
 }
 
 impl Server {
@@ -91,11 +94,19 @@ impl Server {
             sessions: SessionRegistry::default(),
             session_timeout: DEFAULT_SESSION_TIMEOUT,
             agent: agent::SharedAgentHub::default(),
+            session_env: Arc::default(),
         })
     }
 
     pub fn set_session_timeout(&mut self, timeout: Duration) {
         self.session_timeout = timeout;
+    }
+
+    /// Overrides environment variables of spawned sessions (on top of the
+    /// sshd-like defaults). Intended for tests that must confine sessions to
+    /// a scratch HOME.
+    pub fn set_session_env(&mut self, env: Vec<(String, String)>) {
+        self.session_env = Arc::new(env);
     }
 
     /// Puts the forwarded agent socket at a stable path in `dir` (instead of
@@ -117,8 +128,11 @@ impl Server {
             let shell = self.shell.clone();
             let sessions = self.sessions.clone();
             let agent = self.agent.clone();
+            let session_env = Arc::clone(&self.session_env);
             tokio::spawn(async move {
-                if let Err(err) = handle_connection(stream, &auth, &shell, sessions, agent).await {
+                if let Err(err) =
+                    handle_connection(stream, &auth, &shell, sessions, agent, &session_env).await
+                {
                     warn!(%peer, "connection failed: {err}");
                 }
             });
@@ -280,6 +294,7 @@ async fn handle_connection(
     shell: &str,
     sessions: SessionRegistry,
     agent: agent::SharedAgentHub,
+    session_env: &[(String, String)],
 ) -> Result<(), ServerError> {
     let mut ws = tokio_tungstenite::accept_async(stream)
         .await
@@ -307,7 +322,7 @@ async fn handle_connection(
         } => {
             debug!(%command, resumable, forward_agent, "exec");
             let agent = forward_agent.then(|| agent.get_or_start()).transpose()?;
-            let session = start_session(shell, &command, resumable, agent)?;
+            let session = start_session(shell, &command, resumable, agent, session_env)?;
             let session_token = new_resume_token();
             sessions.insert(session_token.clone(), Arc::clone(&session));
             (session_token, session, 0)
@@ -373,6 +388,7 @@ fn start_session(
     command: &str,
     resumable: bool,
     agent: Option<Arc<agent::AgentHub>>,
+    session_env: &[(String, String)],
 ) -> Result<Arc<Session>, ServerError> {
     let mut cmd = tokio::process::Command::new(shell);
     cmd.arg("-c")
@@ -381,6 +397,7 @@ fn start_session(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     session_environment(&mut cmd, shell);
+    cmd.envs(session_env.iter().map(|(key, value)| (key, value)));
     if let Some(agent) = &agent {
         cmd.env("SSH_AUTH_SOCK", agent.socket_path());
     }

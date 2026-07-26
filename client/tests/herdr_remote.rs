@@ -73,13 +73,20 @@ async fn herdr_remote_bootstraps_over_the_transport() {
         std::env::set_var(key, value);
     }
 
-    let server = Server::bind(
+    let mut server = Server::bind(
         "127.0.0.1:0",
         Auth::static_token("test-token".into()),
         "/bin/sh".into(),
     )
     .await
     .unwrap();
+    // The exec server builds an sshd-like environment from the passwd entry;
+    // pin its sessions (the "remote" herdr server) to the scratch HOME too.
+    server.set_session_env(
+        std::env::vars()
+            .filter(|(key, _)| key == "HOME" || key == "PATH" || key.starts_with("XDG_"))
+            .collect(),
+    );
     let addr = server.local_addr().unwrap();
     tokio::spawn(server.run());
 
