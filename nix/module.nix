@@ -75,13 +75,27 @@ in
         description = "UDP port opened in the firewall for the QUIC listener.";
       };
 
+      useACMEHost = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "example.com";
+        description = ''
+          security.acme certificate to use for the QUIC listener; the service
+          is restarted on renewal (sessions survive the restart).
+        '';
+      };
+
       certFile = lib.mkOption {
         type = lib.types.path;
-        description = "TLS certificate chain (PEM) for the QUIC listener, e.g. the host's ACME cert.";
+        default = "${config.security.acme.certs.${cfg.quic.useACMEHost}.directory}/fullchain.pem";
+        defaultText = "fullchain.pem of useACMEHost";
+        description = "TLS certificate chain (PEM) for the QUIC listener.";
       };
 
       keyFile = lib.mkOption {
         type = lib.types.path;
+        default = "${config.security.acme.certs.${cfg.quic.useACMEHost}.directory}/key.pem";
+        defaultText = "key.pem of useACMEHost";
         description = "TLS private key (PEM) matching certFile.";
       };
     };
@@ -158,6 +172,12 @@ in
     };
 
     networking.firewall.allowedUDPPorts = lib.mkIf cfg.quic.enable [ cfg.quic.port ];
+
+    # The certificate is loaded at startup (systemd credential); pick up
+    # renewals by restarting, which keeps sessions thanks to the fd store.
+    security.acme.certs = lib.optionalAttrs (cfg.quic.enable && cfg.quic.useACMEHost != null) {
+      ${cfg.quic.useACMEHost}.reloadServices = [ "herdr-eternal-server.service" ];
+    };
 
     # Socket activation: the listener stays open across service restarts, so
     # deploys do not refuse connections while the daemon comes back up.
