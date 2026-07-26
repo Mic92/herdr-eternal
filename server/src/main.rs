@@ -7,14 +7,23 @@ use herdr_eternal_server::{Auth, OidcConfig, Server};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: herdr-eternal-server --listen <addr:port> [--token-file <path>]\n\
+        "usage: herdr-eternal-server [--listen <addr:port>] [--token-file <path>]\n\
          \x20                          [--oidc-issuer <url> --oidc-client-id <id> --oidc-allowed-sub <sub>]\n\
          \x20                          [--session-timeout-secs <secs>]\n\
          The token file contains the pre-shared token clients may present.\n\
          With --oidc-* set, OIDC bearer tokens from that issuer are also accepted.\n\
+         Without --listen, a listener from systemd socket activation is expected.\n\
          Disconnected sessions are killed after the session timeout (default 7 days)."
     );
     ExitCode::FAILURE
+}
+
+/// The listening socket handed over by systemd socket activation, if any.
+fn activation_listener() -> Option<std::net::TcpListener> {
+    let fd = sd_notify::listen_fds().ok()?.next()?;
+    // SAFETY: the fd comes from LISTEN_FDS; systemd owns no other reference
+    // and listen_fds() clears the environment so it is claimed only once.
+    Some(unsafe { <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(fd) })
 }
 
 /// The user's login shell from the passwd database, like sshd uses.
@@ -52,9 +61,10 @@ fn main() -> ExitCode {
             _ => return usage(),
         }
     }
-    let Some(listen) = listen else {
+    let activation = activation_listener();
+    if listen.is_none() && activation.is_none() {
         return usage();
-    };
+    }
     let static_token = match token_file {
         Some(token_file) => match std::fs::read_to_string(&token_file) {
             Ok(token) => Some(token.trim().to_string()),
@@ -86,7 +96,12 @@ fn main() -> ExitCode {
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = runtime.block_on(async {
-        let mut server = Server::bind(&listen, Auth::new(static_token, oidc), shell).await?;
+        let auth = Auth::new(static_token, oidc);
+        let mut server = match (activation, listen) {
+            (Some(listener), _) => Server::from_std_listener(listener, auth, shell)?,
+            (None, Some(listen)) => Server::bind(&listen, auth, shell).await?,
+            (None, None) => unreachable!("checked above"),
+        };
         if let Some(timeout) = session_timeout {
             server.set_session_timeout(timeout);
         }
@@ -95,6 +110,9 @@ fn main() -> ExitCode {
         if let Some(dir) = std::env::var_os("RUNTIME_DIRECTORY") {
             server.set_agent_runtime_dir(dir.into());
         }
+        // Under Type=notify systemd (and anything ordered after the unit,
+        // like nginx) only proceeds once the listener is ready.
+        sd_notify::notify(false, &[sd_notify::NotifyState::Ready]).ok();
         server.run().await
     });
     match result {

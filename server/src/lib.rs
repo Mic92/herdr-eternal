@@ -64,6 +64,25 @@ pub struct Server {
 impl Server {
     pub async fn bind(addr: &str, auth: Auth, shell: String) -> Result<Self, ServerError> {
         let listener = TcpListener::bind(addr).await?;
+        Self::with_listener(listener, auth, shell)
+    }
+
+    /// Serves on an already-bound listener, e.g. one passed in through
+    /// systemd socket activation.
+    pub fn from_std_listener(
+        listener: std::net::TcpListener,
+        auth: Auth,
+        shell: String,
+    ) -> Result<Self, ServerError> {
+        listener.set_nonblocking(true)?;
+        Self::with_listener(TcpListener::from_std(listener)?, auth, shell)
+    }
+
+    fn with_listener(
+        listener: TcpListener,
+        auth: Auth,
+        shell: String,
+    ) -> Result<Self, ServerError> {
         info!(addr = %listener.local_addr()?, "listening");
         Ok(Self {
             listener,

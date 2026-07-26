@@ -93,14 +93,14 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
       serviceConfig = {
+        # The service signals readiness once the socket-activated listener
+        # is being served, so dependent units never race the daemon.
+        Type = "notify";
         # Stable location for the forwarded SSH agent socket.
         RuntimeDirectory = "herdr-eternal-server";
         RuntimeDirectoryMode = "0700";
         ExecStart = lib.concatStringsSep " " (
-          [
-            (lib.getExe' cfg.package "herdr-eternal-server")
-            "--listen ${cfg.listenAddress}"
-          ]
+          [ (lib.getExe' cfg.package "herdr-eternal-server") ]
           ++ lib.optional (cfg.tokenFile != null) "--token-file %d/token"
           ++ lib.optionals (cfg.oidc.issuer != null) [
             "--oidc-issuer ${cfg.oidc.issuer}"
@@ -113,6 +113,13 @@ in
         Restart = "on-failure";
         RestartSec = 2;
       };
+    };
+
+    # Socket activation: the listener stays open across service restarts, so
+    # deploys do not refuse connections while the daemon comes back up.
+    systemd.sockets.herdr-eternal-server = {
+      wantedBy = [ "sockets.target" ];
+      listenStreams = [ cfg.listenAddress ];
     };
 
     services.nginx.virtualHosts.${cfg.nginx.hostName} = lib.mkIf cfg.nginx.enable {
