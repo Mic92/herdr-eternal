@@ -7,7 +7,8 @@
 //! everything the client has not seen yet, byte-exactly.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,7 +19,7 @@ use herdr_eternal_proto as proto;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::pipe;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
@@ -123,9 +124,21 @@ impl Server {
     }
 
     pub async fn run(self) -> Result<(), ServerError> {
+        Arc::new(self).serve().await
+    }
+
+    /// Accepts connections until SIGTERM, then hands resumable sessions over
+    /// to the systemd fd store so the next daemon instance can resume them.
+    pub async fn serve(self: Arc<Self>) -> Result<(), ServerError> {
         tokio::spawn(expire_sessions(self.sessions.clone(), self.session_timeout));
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         loop {
-            let (stream, peer) = self.listener.accept().await?;
+            let accepted = tokio::select! {
+                accepted = self.listener.accept() => accepted,
+                _ = sigterm.recv() => return self.shut_down().await,
+            };
+            let (stream, peer) = accepted?;
             let auth = Arc::clone(&self.auth);
             let shell = self.shell.clone();
             let sessions = self.sessions.clone();
@@ -139,6 +152,143 @@ impl Server {
                 }
             });
         }
+    }
+
+    /// Pushes the fds of every resumable session into the systemd fd store so
+    /// they survive the coming restart. Without systemd (no runtime
+    /// directory) there is nowhere to put them and the sessions die with this
+    /// process.
+    async fn shut_down(&self) -> Result<(), ServerError> {
+        let Some(dir) = std::env::var_os("RUNTIME_DIRECTORY") else {
+            return Ok(());
+        };
+        let handover = self.handover_sessions(Path::new(&dir)).await?;
+        for (name, fd) in &handover {
+            sd_notify::notify_with_fds(
+                false,
+                &[
+                    sd_notify::NotifyState::FdStore,
+                    sd_notify::NotifyState::FdName(name),
+                ],
+                &[fd.as_fd()],
+            )
+            .ok();
+        }
+        info!(fds = handover.len(), "handed sessions over to the fd store");
+        Ok(())
+    }
+
+    /// Detaches every resumable session from this daemon: their state goes to
+    /// `sessions.json` in `dir`, their still-open pipe fds are returned named
+    /// `<token>.<role>`, both to be given to [`Server::restore_sessions`] of
+    /// the next daemon instance. The children keep running unsupervised in
+    /// between.
+    pub async fn handover_sessions(
+        &self,
+        dir: &Path,
+    ) -> Result<Vec<(String, OwnedFd)>, ServerError> {
+        let mut fds = Vec::new();
+        let mut records = HashMap::new();
+        for (token, session) in self.sessions.entries() {
+            if !session.resumable {
+                continue;
+            }
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if session
+                .inbound
+                .send(SessionInput::Handover(reply_tx))
+                .is_err()
+            {
+                continue; // the session task already ended
+            }
+            let Ok(Ok(handover)) = tokio::time::timeout(Duration::from_secs(5), reply_rx).await
+            else {
+                warn!(%token, "session did not answer the handover request");
+                continue;
+            };
+            let mut state = handover.state;
+            state.forward_agent = session.agent.is_some();
+            for (role, fd) in handover.fds {
+                fds.push((format!("{token}.{role}"), fd));
+            }
+            // The session now belongs to the next daemon instance; this one
+            // must no longer serve resumes for it.
+            self.sessions.remove(&token);
+            records.insert(token, state);
+        }
+        let json = serde_json::to_vec(&records).map_err(std::io::Error::other)?;
+        std::fs::write(dir.join("sessions.json"), json)?;
+        Ok(fds)
+    }
+
+    /// Re-creates the sessions a previous daemon instance handed over:
+    /// `sessions.json` in `dir` plus the fds reclaimed from the fd store.
+    pub fn restore_sessions(
+        &self,
+        dir: &Path,
+        fds: Vec<(String, OwnedFd)>,
+    ) -> Result<(), ServerError> {
+        let path = dir.join("sessions.json");
+        let Ok(json) = std::fs::read(&path) else {
+            return Ok(());
+        };
+        std::fs::remove_file(&path).ok();
+        let records: HashMap<String, SessionRecord> =
+            serde_json::from_slice(&json).map_err(std::io::Error::other)?;
+        let mut fds_by_token: HashMap<String, HashMap<String, OwnedFd>> = HashMap::new();
+        for (name, fd) in fds {
+            if let Some((token, role)) = name.rsplit_once('.') {
+                fds_by_token
+                    .entry(token.to_string())
+                    .or_default()
+                    .insert(role.to_string(), fd);
+            }
+        }
+        // Streams that already hit EOF get a pipe that is instantly at EOF
+        // again, so the session task needs no special case for them.
+        fn receiver(fd: Option<OwnedFd>) -> std::io::Result<pipe::Receiver> {
+            let fd = match fd {
+                Some(fd) => fd,
+                None => {
+                    let (read, _write) = std::io::pipe()?;
+                    OwnedFd::from(read)
+                }
+            };
+            pipe::Receiver::from_owned_fd(fd)
+        }
+        for (token, record) in records {
+            let mut roles = fds_by_token.remove(&token).unwrap_or_default();
+            let io = SessionIo {
+                stdin: roles
+                    .remove("stdin")
+                    .and_then(|fd| pipe::Sender::from_owned_fd(fd).ok()),
+                stdout: receiver(roles.remove("stdout"))?,
+                stderr: receiver(roles.remove("stderr"))?,
+                exit: receiver(roles.remove("exit"))?,
+                exit_code: record.exit_code,
+                child: None,
+                pgid: nix::unistd::Pid::from_raw(record.pgid),
+            };
+            let log = Arc::new(OutboundLog::restore(record.trimmed, record.buffer));
+            let stdin_applied = Arc::new(AtomicU64::new(record.stdin_applied));
+            let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+            let session = Arc::new(Session {
+                inbound: inbound_tx,
+                log: Arc::clone(&log),
+                stdin_applied: Arc::clone(&stdin_applied),
+                agent: record
+                    .forward_agent
+                    .then(|| self.agent.get_or_start())
+                    .transpose()?,
+                attached: AtomicUsize::new(0),
+                detached_at: Mutex::new(Some(tokio::time::Instant::now())),
+                resumable: true,
+            });
+            info!(%token, "restored handed-over session");
+            self.sessions.insert(token, session);
+            tokio::spawn(session_task(io, inbound_rx, log, stdin_applied));
+        }
+        Ok(())
     }
 }
 
@@ -185,12 +335,56 @@ impl OutboundLog {
     fn subscribe(&self) -> watch::Receiver<u64> {
         self.latest.subscribe()
     }
+
+    /// The unacknowledged buffer contents, for a handover to the next daemon
+    /// instance.
+    fn snapshot(&self) -> (u64, Vec<proto::ChannelMessage>) {
+        let entries = self.entries.lock().unwrap();
+        (entries.trimmed, entries.buffer.iter().cloned().collect())
+    }
+
+    /// Rebuilds a log handed over by the previous daemon instance.
+    fn restore(trimmed: u64, buffer: Vec<proto::ChannelMessage>) -> Self {
+        let latest = trimmed + buffer.len() as u64;
+        Self {
+            entries: Mutex::new(LogEntries {
+                buffer: buffer.into(),
+                trimmed,
+            }),
+            latest: watch::Sender::new(latest),
+        }
+    }
 }
 
 enum SessionInput {
     Message(proto::ChannelMessage),
     /// The attached client went away and the session is not resumable.
     Abort,
+    /// The daemon is shutting down: give the session's state and pipe fds
+    /// back for the handover and stop supervising the child.
+    Handover(oneshot::Sender<SessionHandover>),
+}
+
+/// State of a resumable session travelling from one daemon instance to the
+/// next across a restart: the fds go through the systemd fd store, the rest
+/// as `sessions.json` in the runtime directory.
+struct SessionHandover {
+    state: SessionRecord,
+    /// The still-open pipe ends, keyed by role (stdin/stdout/stderr/exit).
+    fds: Vec<(&'static str, OwnedFd)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SessionRecord {
+    pgid: i32,
+    exit_code: Option<i32>,
+    /// Outbound messages already dropped after the client acknowledged them.
+    trimmed: u64,
+    /// Outbound messages the client has not acknowledged yet.
+    buffer: Vec<proto::ChannelMessage>,
+    /// Highest client stdin sequence number applied so far.
+    stdin_applied: u64,
+    forward_agent: bool,
 }
 
 struct Session {
@@ -257,6 +451,15 @@ impl SessionRegistry {
 
     fn remove(&self, token: &str) {
         self.0.lock().unwrap().remove(token);
+    }
+
+    fn entries(&self) -> Vec<(String, Arc<Session>)> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(token, session)| (token.clone(), Arc::clone(session)))
+            .collect()
     }
 
     /// Sessions that have had no attached connection for longer than `timeout`.
@@ -397,6 +600,8 @@ struct SessionIo {
     /// daemon is not necessarily the child's parent (after a restart), so
     /// wait() cannot be relied on for the status.
     exit: pipe::Receiver,
+    /// Already-known exit code of a session reclaimed after a restart.
+    exit_code: Option<i32>,
     child: Option<tokio::process::Child>,
     /// The session's process group, used to abort it.
     pgid: nix::unistd::Pid,
@@ -458,6 +663,7 @@ fn start_session(
         stdout: pipe::Receiver::from_owned_fd(OwnedFd::from(stdout_read))?,
         stderr: pipe::Receiver::from_owned_fd(OwnedFd::from(stderr_read))?,
         exit: pipe::Receiver::from_owned_fd(OwnedFd::from(exit_read))?,
+        exit_code: None,
         child: Some(child),
         pgid,
     };
@@ -477,19 +683,6 @@ fn start_session(
 
     tokio::spawn(session_task(io, inbound_rx, log, stdin_applied));
     Ok(session)
-}
-
-/// The exit code reported by the wrapper, or 255 if it died without one.
-async fn read_exit_code(mut exit: pipe::Receiver) -> i32 {
-    let mut line = Vec::new();
-    let mut buf = [0_u8; 16];
-    while !line.contains(&b'\n') {
-        match exit.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => line.extend_from_slice(&buf[..n]),
-        }
-    }
-    String::from_utf8_lossy(&line).trim().parse().unwrap_or(255)
 }
 
 /// Kills the session's process group and reaps the wrapper if it is ours.
@@ -515,21 +708,24 @@ async fn session_task(
         mut stdin,
         mut stdout,
         mut stderr,
-        exit,
+        mut exit,
+        mut exit_code,
         mut child,
         pgid,
     } = io;
-    let exit_status = read_exit_code(exit);
-    tokio::pin!(exit_status);
     let mut stdout_buf = [0_u8; 16 * 1024];
     let mut stderr_buf = [0_u8; 16 * 1024];
     let mut stdout_open = true;
     let mut stderr_open = true;
-    let mut exit_code = None;
-    let mut seq: u64 = 0;
+    // The exit code arrives as a line on the wrapper's dedicated pipe.
+    let mut exit_buf = [0_u8; 16];
+    let mut exit_line = Vec::new();
+    // For a session restored after a restart these pick up where the previous
+    // daemon instance left off; for a fresh session they start at zero.
+    let mut seq: u64 = *log.subscribe().borrow();
     // Highest client sequence number applied; duplicates from a resend after
     // resume are dropped here.
-    let mut last_client_seq: u64 = 0;
+    let mut last_client_seq: u64 = stdin_applied.load(Ordering::Relaxed);
 
     loop {
         tokio::select! {
@@ -551,11 +747,24 @@ async fn session_task(
                     }
                 }
             }
-            code = &mut exit_status, if exit_code.is_none() => {
-                exit_code = Some(code);
+            read = exit.read(&mut exit_buf), if exit_code.is_none() => {
+                match read {
+                    // EOF without a code line: the wrapper itself was killed.
+                    Ok(0) | Err(_) => exit_code = Some(255),
+                    Ok(n) => {
+                        exit_line.extend_from_slice(&exit_buf[..n]);
+                        if exit_line.contains(&b'\n') {
+                            exit_code = Some(
+                                String::from_utf8_lossy(&exit_line).trim().parse().unwrap_or(255),
+                            );
+                        }
+                    }
+                }
                 // Reap the wrapper when this daemon is its parent.
-                if let Some(child) = child.as_mut() {
-                    child.wait().await.ok();
+                if exit_code.is_some() {
+                    if let Some(child) = child.as_mut() {
+                        child.wait().await.ok();
+                    }
                 }
             }
             input = inbound.recv() => {
@@ -580,6 +789,44 @@ async fn session_task(
                     }
                     Some(SessionInput::Message(other)) => {
                         debug!(?other, "ignoring unexpected channel message");
+                    }
+                    Some(SessionInput::Handover(reply)) => {
+                        // Give the pipes back for the systemd fd store; the
+                        // child keeps running unsupervised until the next
+                        // daemon instance picks the session up again.
+                        let mut fds = Vec::new();
+                        if let Some(pipe) = stdin.take() {
+                            if let Ok(fd) = pipe.into_nonblocking_fd() {
+                                fds.push(("stdin", fd));
+                            }
+                        }
+                        for (role, pipe, open) in [
+                            ("stdout", stdout, stdout_open),
+                            ("stderr", stderr, stderr_open),
+                            ("exit", exit, exit_code.is_none()),
+                        ] {
+                            if !open {
+                                continue;
+                            }
+                            if let Ok(fd) = pipe.into_nonblocking_fd() {
+                                fds.push((role, fd));
+                            }
+                        }
+                        let (trimmed, buffer) = log.snapshot();
+                        reply
+                            .send(SessionHandover {
+                                state: SessionRecord {
+                                    pgid: pgid.as_raw(),
+                                    exit_code,
+                                    trimmed,
+                                    buffer,
+                                    stdin_applied: last_client_seq,
+                                    forward_agent: false,
+                                },
+                                fds,
+                            })
+                            .ok();
+                        return;
                     }
                     Some(SessionInput::Abort) => {
                         abort_session(pgid, &mut child).await;

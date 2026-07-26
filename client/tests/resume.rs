@@ -7,8 +7,9 @@ mod support;
 use std::time::Duration;
 
 use herdr_eternal_server::{Auth, Server};
-use herdr_eternal_ssh::{Target, run_exec};
+use herdr_eternal_ssh::Target;
 use support::proxy::FlakyProxy;
+use support::{assert_counting_output, spawn_counting_exec};
 
 async fn start_server_behind_proxy() -> FlakyProxy {
     let server = Server::bind(
@@ -21,28 +22,6 @@ async fn start_server_behind_proxy() -> FlakyProxy {
     let upstream = server.local_addr().unwrap();
     tokio::spawn(server.run());
     FlakyProxy::start(upstream).await.unwrap()
-}
-
-/// Runs the slow counting script against `target`; returns (code, stdout, stderr).
-fn spawn_counting_exec(target: Target) -> tokio::task::JoinHandle<(i32, Vec<u8>, Vec<u8>)> {
-    tokio::spawn(async move {
-        // Slow, deterministic output so the netsplit hits mid-stream.
-        let stdin: &[u8] = b"for i in $(seq 1 20); do echo $i; sleep 0.05; done\n";
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let code = run_exec(&target, "/bin/sh -s", stdin, &mut stdout, &mut stderr)
-            .await
-            .unwrap();
-        (code, stdout, stderr)
-    })
-}
-
-fn assert_counting_output(result: (i32, Vec<u8>, Vec<u8>)) {
-    let (code, stdout, stderr) = result;
-    let expected: String = (1..=20).map(|i| format!("{i}\n")).collect();
-    assert_eq!(String::from_utf8(stdout).unwrap(), expected);
-    assert_eq!(String::from_utf8(stderr).unwrap(), "");
-    assert_eq!(code, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,6 +1,8 @@
 //! herdr-eternal-server: accepts exec channels over WebSocket (behind nginx)
 //! and runs commands through the user's shell. See PLAN.md.
 
+use std::os::fd::{FromRawFd, OwnedFd};
+use std::path::Path;
 use std::process::ExitCode;
 
 use herdr_eternal_server::{Auth, OidcConfig, Server};
@@ -18,12 +20,27 @@ fn usage() -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// The listening socket handed over by systemd socket activation, if any.
-fn activation_listener() -> Option<std::net::TcpListener> {
-    let fd = sd_notify::listen_fds().ok()?.next()?;
-    // SAFETY: the fd comes from LISTEN_FDS; systemd owns no other reference
-    // and listen_fds() clears the environment so it is claimed only once.
-    Some(unsafe { <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+/// Fds passed in by systemd: the listening socket from socket activation and
+/// any session fds a previous instance pushed into the fd store (named
+/// `<token>.<role>`).
+fn activation_fds() -> (Option<std::net::TcpListener>, Vec<(String, OwnedFd)>) {
+    let mut listener = None;
+    let mut sessions = Vec::new();
+    let Ok(fds) = sd_notify::listen_fds_with_names(true) else {
+        return (listener, sessions);
+    };
+    const SESSION_ROLES: [&str; 4] = [".stdin", ".stdout", ".stderr", ".exit"];
+    for (fd, name) in fds {
+        // SAFETY: the fd comes from LISTEN_FDS; systemd owns no other
+        // reference and the environment is cleared so it is claimed only once.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        if SESSION_ROLES.iter().any(|role| name.ends_with(role)) {
+            sessions.push((name, fd));
+        } else if listener.is_none() {
+            listener = Some(std::net::TcpListener::from(fd));
+        }
+    }
+    (listener, sessions)
 }
 
 /// The user's login shell from the passwd database, like sshd uses.
@@ -61,7 +78,7 @@ fn main() -> ExitCode {
             _ => return usage(),
         }
     }
-    let activation = activation_listener();
+    let (activation, session_fds) = activation_fds();
     if listen.is_none() && activation.is_none() {
         return usage();
     }
@@ -106,9 +123,11 @@ fn main() -> ExitCode {
             server.set_session_timeout(timeout);
         }
         // Set by systemd for RuntimeDirectory=; gives forwarded agent sockets
-        // a stable path that survives daemon restarts.
+        // a stable path that survives daemon restarts and holds the state of
+        // sessions handed over across a restart.
         if let Some(dir) = std::env::var_os("RUNTIME_DIRECTORY") {
-            server.set_agent_runtime_dir(dir.into());
+            server.set_agent_runtime_dir(dir.clone().into());
+            server.restore_sessions(Path::new(&dir), session_fds)?;
         }
         // Under Type=notify systemd (and anything ordered after the unit,
         // like nginx) only proceeds once the listener is ready.

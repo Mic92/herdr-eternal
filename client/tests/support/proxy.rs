@@ -3,6 +3,9 @@
 //! connections are always forwarded again, so reconnect/resume paths can be
 //! exercised.
 
+// Every test binary compiles this shared helper but uses only a subset of it.
+#![allow(dead_code)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
