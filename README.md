@@ -27,7 +27,13 @@ invisible to herdr.
   services.herdr-eternal-server = {
     enable = true;
     user = "joerg";                       # exec channels run as this user
+    # Either a pre-shared token, OIDC, or both:
     tokenFile = config.sops.secrets.herdr-eternal-token.path;
+    oidc = {
+      issuer = "https://auth.example.com";
+      clientId = "herdr-eternal";
+      allowedSub = "joerg";
+    };
     nginx = {
       enable = true;
       hostName = "example.com";           # existing TLS-terminating vhost
@@ -47,7 +53,11 @@ WebSocket upgrade.
 ```toml
 [targets.mybox]
 url = "wss://example.com/herdr-eternal"
+# Either a pre-shared token ...
 token = "..."
+# ... or OIDC (then run: herdr-eternal-ssh login mybox)
+issuer = "https://auth.example.com"
+client_id = "herdr-eternal"
 ```
 
 herdr config:
@@ -75,6 +85,6 @@ $ nix flake check   # clippy, tests (incl. patched-herdr e2e), NixOS VM test
 - [x] Byte-exact resume after connection loss (client retries for 60s)
 - [x] End-to-end test driving a patched `herdr --remote`
 - [x] NixOS module + nginx integration + VM test
-- [ ] OIDC device-code login instead of pre-shared tokens
+- [x] OIDC device-code login as an alternative to pre-shared tokens
 - [ ] Bounded replay buffers, session expiry, keepalives for silent drops
 - [ ] Optional QUIC direct path (connection migration)

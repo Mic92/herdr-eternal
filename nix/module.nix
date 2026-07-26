@@ -31,11 +31,33 @@ in
     };
 
     tokenFile = lib.mkOption {
-      type = lib.types.path;
+      type = lib.types.nullOr lib.types.path;
+      default = null;
       description = ''
-        File containing the pre-shared token clients must present.
+        File containing the pre-shared token clients may present.
         Loaded via systemd credentials, so a sops-nix/agenix secret path works.
       '';
+    };
+
+    oidc = {
+      issuer = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "https://auth.example.com";
+        description = "OIDC issuer URL. Setting it enables bearer-token authentication.";
+      };
+
+      clientId = lib.mkOption {
+        type = lib.types.str;
+        default = "herdr-eternal";
+        description = "OAuth client id expected in the token audience.";
+      };
+
+      allowedSub = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Only tokens with this sub claim are accepted (single-user daemon).";
+      };
     };
 
     shell = lib.mkOption {
@@ -61,14 +83,36 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = cfg.tokenFile != null || cfg.oidc.issuer != null;
+        message = "services.herdr-eternal-server needs tokenFile and/or oidc.issuer";
+      }
+      {
+        assertion = (cfg.oidc.issuer == null) == (cfg.oidc.allowedSub == null);
+        message = "services.herdr-eternal-server: set oidc.issuer and oidc.allowedSub together";
+      }
+    ];
+
     systemd.services.herdr-eternal-server = {
       description = "Roaming-friendly transport for herdr --remote";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
       environment.SHELL = cfg.shell;
       serviceConfig = {
-        ExecStart = "${lib.getExe' cfg.package "herdr-eternal-server"} --listen ${cfg.listenAddress} --token-file %d/token";
-        LoadCredential = "token:${cfg.tokenFile}";
+        ExecStart = lib.concatStringsSep " " (
+          [
+            (lib.getExe' cfg.package "herdr-eternal-server")
+            "--listen ${cfg.listenAddress}"
+          ]
+          ++ lib.optional (cfg.tokenFile != null) "--token-file %d/token"
+          ++ lib.optionals (cfg.oidc.issuer != null) [
+            "--oidc-issuer ${cfg.oidc.issuer}"
+            "--oidc-client-id ${cfg.oidc.clientId}"
+            "--oidc-allowed-sub ${cfg.oidc.allowedSub}"
+          ]
+        );
+        LoadCredential = lib.optional (cfg.tokenFile != null) "token:${cfg.tokenFile}";
         User = cfg.user;
         Restart = "on-failure";
         RestartSec = 2;
