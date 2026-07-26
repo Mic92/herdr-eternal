@@ -70,6 +70,16 @@ async fn oidc_bearer_tokens_are_validated() {
     let wrong_audience = issuer.token(ALLOWED_SUB, "other-app", 300);
     assert!(!handshake_accepted(addr, &wrong_audience).await);
 
+    // Authelia's device-code flow (as of 4.39) never grants an audience: such
+    // tokens are accepted based on client_id and the pairwise sub instead.
+    let device = issuer.device_token(ALLOWED_SUB, CLIENT_ID);
+    assert!(handshake_accepted(addr, &device).await);
+
+    // ... but a token minted for a different OAuth client stays rejected even
+    // without an audience.
+    let other_client = issuer.device_token(ALLOWED_SUB, "other-app");
+    assert!(!handshake_accepted(addr, &other_client).await);
+
     let expired = issuer.token(ALLOWED_SUB, CLIENT_ID, -300);
     assert!(!handshake_accepted(addr, &expired).await);
 

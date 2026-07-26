@@ -24,6 +24,10 @@ pub enum AuthError {
     SubNotAllowed(String),
     #[error("token has no subject")]
     MissingSub,
+    #[error("token is not addressed to this service")]
+    WrongAudience,
+    #[error("token was issued to OAuth client {0:?}")]
+    WrongClient(String),
 }
 
 /// OIDC validation settings.
@@ -96,6 +100,41 @@ struct Claims {
     /// Some providers (e.g. Authelia) omit `sub` for client_credentials
     /// grants and only set `client_id`.
     client_id: Option<String>,
+    /// Absent on Authelia device-flow tokens: released Authelia (4.39) never
+    /// grants an audience in that flow, so `aud` cannot be required yet.
+    #[serde(default)]
+    aud: Audience,
+}
+
+/// The `aud` claim in its two JSON shapes, or absent.
+#[derive(Deserialize, Default)]
+#[serde(untagged)]
+enum Audience {
+    #[default]
+    Missing,
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Audience {
+    /// An audience is only rejected when the token is explicitly addressed to
+    /// somebody else; tokens without one are tied to us via the client_id and
+    /// pairwise sub checks instead.
+    fn accepts(&self, expected: &str) -> bool {
+        match self {
+            Audience::Missing => true,
+            Audience::One(aud) => aud == expected,
+            Audience::Many(auds) => auds.is_empty() || auds.iter().any(|aud| aud == expected),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Audience::Missing => true,
+            Audience::One(_) => false,
+            Audience::Many(auds) => auds.is_empty(),
+        }
+    }
 }
 
 impl Oidc {
@@ -105,8 +144,25 @@ impl Oidc {
 
         let mut validation = jsonwebtoken::Validation::new(header.alg);
         validation.set_issuer(&[&self.config.issuer]);
-        validation.set_audience(&[&self.config.client_id]);
+        // Audience is checked manually so that Authelia's aud-less device-flow
+        // tokens can be accepted; jsonwebtoken would reject a missing claim.
+        validation.validate_aud = false;
         let claims = jsonwebtoken::decode::<Claims>(token, &key, &validation)?.claims;
+
+        if !claims.aud.accepts(&self.config.client_id) {
+            return Err(AuthError::WrongAudience);
+        }
+        if let Some(client_id) = &claims.client_id {
+            if client_id != &self.config.client_id {
+                return Err(AuthError::WrongClient(client_id.clone()));
+            }
+        }
+        if claims.aud.is_empty() {
+            tracing::warn!(
+                "accepting token without an audience; the identity provider does not grant one \
+                 for this flow"
+            );
+        }
 
         // The subject identifies the user; tokens from the client_credentials
         // grant may only carry client_id, which requires the client secret to

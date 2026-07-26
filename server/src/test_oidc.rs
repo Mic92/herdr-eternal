@@ -41,7 +41,8 @@ struct Claims {
     sub: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     client_id: Option<String>,
-    aud: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aud: Option<String>,
     exp: u64,
     iat: u64,
 }
@@ -111,13 +112,21 @@ impl FakeIssuer {
     /// Mints a signed token; `expires_in` may be negative to produce an
     /// already-expired token.
     pub fn token(&self, sub: &str, audience: &str, expires_in_secs: i64) -> String {
-        self.inner.token(Some(sub), audience, expires_in_secs)
+        self.inner
+            .token(Some(sub), None, Some(audience), expires_in_secs)
     }
 
     /// Mints a client_credentials-style token: no `sub`, only `client_id`
     /// (matching e.g. Authelia's behaviour).
     pub fn client_credentials_token(&self, client_id: &str) -> String {
-        self.inner.token(None, client_id, 300)
+        self.inner
+            .token(None, Some(client_id), Some(client_id), 300)
+    }
+
+    /// Mints a device-flow-style token the way Authelia 4.39 does: `sub` and
+    /// `client_id` are set, but no audience is granted.
+    pub fn device_token(&self, sub: &str, client_id: &str) -> String {
+        self.inner.token(Some(sub), Some(client_id), None, 3600)
     }
 }
 
@@ -126,7 +135,13 @@ impl Inner {
         format!("http://{}", self.addr)
     }
 
-    fn token(&self, sub: Option<&str>, audience: &str, expires_in_secs: i64) -> String {
+    fn token(
+        &self,
+        sub: Option<&str>,
+        client_id: Option<&str>,
+        audience: Option<&str>,
+        expires_in_secs: i64,
+    ) -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock after epoch")
@@ -134,8 +149,8 @@ impl Inner {
         let claims = Claims {
             iss: self.issuer_url(),
             sub: sub.map(str::to_string),
-            client_id: sub.is_none().then(|| audience.to_string()),
-            aud: audience.to_string(),
+            client_id: client_id.map(str::to_string),
+            aud: audience.map(str::to_string),
             exp: now.saturating_add_signed(expires_in_secs),
             iat: now,
         };
@@ -200,8 +215,9 @@ async fn token_grant(
         return oauth_error("access_denied");
     };
 
+    // Mirror Authelia's device-code grant: sub and client_id claims, no aud.
     axum::Json(serde_json::json!({
-        "access_token": inner.token(Some(&sub), &client_id, 3600),
+        "access_token": inner.token(Some(&sub), Some(&client_id), None, 3600),
         "token_type": "Bearer",
         "expires_in": 3600,
         "refresh_token": REFRESH_TOKEN,
