@@ -287,9 +287,7 @@ async fn handle_connection(
             forward_agent,
         } => {
             debug!(%command, resumable, forward_agent, "exec");
-            let agent = forward_agent
-                .then(|| agent.get_or_start())
-                .transpose()?;
+            let agent = forward_agent.then(|| agent.get_or_start()).transpose()?;
             let session = start_session(shell, &command, resumable, agent)?;
             let session_token = new_resume_token();
             sessions.insert(session_token.clone(), Arc::clone(&session));
