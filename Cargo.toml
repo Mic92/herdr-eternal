@@ -13,5 +13,8 @@ herdr-eternal-proto = { path = "proto" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-std", "io-util", "sync", "time"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
