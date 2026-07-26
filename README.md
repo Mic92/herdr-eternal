@@ -89,5 +89,9 @@ $ nix flake check   # clippy, tests (incl. patched-herdr e2e), NixOS VM test
 - [x] End-to-end test driving a patched `herdr --remote`
 - [x] NixOS module + nginx integration + VM test
 - [x] OIDC device-code login as an alternative to pre-shared tokens
-- [ ] Bounded replay buffers, session expiry, keepalives for silent drops
+- [x] Bounded replay buffers, session expiry, keepalives for silent drops
+- [x] Opt-in SSH agent forwarding (`forward_agent`)
+- [x] sshd-like sessions: login shell from passwd, clean login environment
+- [x] Socket activation and readiness notification (no accept gap on restart)
+- [x] Sessions survive daemon restarts (systemd fd store handover)
 - [ ] Optional QUIC direct path (connection migration)
