@@ -23,8 +23,10 @@ pub(crate) enum Conn {
     Quic {
         send: quinn::SendStream,
         recv: quinn::RecvStream,
-        /// Keep the connection (and through it the endpoint) alive.
+        /// Keep the connection and its endpoint (whose driver carries the
+        /// connection's traffic) alive for as long as the channel is used.
         _connection: quinn::Connection,
+        _endpoint: quinn::Endpoint,
     },
 }
 
@@ -196,5 +198,6 @@ async fn connect_quic(target: &Target, addr: &str) -> Result<Conn, ClientError> 
         send,
         recv,
         _connection: connection,
+        _endpoint: endpoint,
     })
 }

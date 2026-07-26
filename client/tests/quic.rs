@@ -58,6 +58,30 @@ async fn exec_runs_over_quic() {
     assert_eq!(code, 3);
 }
 
+/// Regression test: the QUIC endpoint must stay alive for the whole exec;
+/// dropping it after connecting kills long-running sessions mid-flight.
+#[tokio::test]
+async fn long_running_exec_stays_connected_over_quic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_test_cert(dir.path());
+    let (server, quic_addr) = quic_server(&cert, &key).await;
+    tokio::spawn(server.run());
+
+    let mut target = Target::new("ws://127.0.0.1:9".to_string(), "secret".into());
+    target.quic_addr = Some(quic_addr.to_string());
+    target.quic_ca = Some(cert.clone());
+
+    let stdin: &[u8] = b"echo start; sleep 2; echo still-here\n";
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = run_exec(&target, "/bin/sh -s", stdin, &mut stdout, &mut stderr)
+        .await
+        .unwrap();
+
+    assert_eq!(String::from_utf8(stdout).unwrap(), "start\nstill-here\n");
+    assert_eq!(code, 0);
+}
+
 #[tokio::test]
 async fn falls_back_to_websocket_when_quic_is_unreachable() {
     let server = Server::bind(
