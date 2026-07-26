@@ -15,10 +15,7 @@ async fn exec_roundtrip_through_client_and_server() {
     let addr = server.local_addr().unwrap();
     tokio::spawn(server.run());
 
-    let target = Target {
-        url: format!("ws://{addr}"),
-        token: "secret".into(),
-    };
+    let target = Target::new(format!("ws://{addr}"), "secret".into());
     let stdin: &[u8] = b"echo from-stdin-script\necho on-stderr >&2\nexit 7\n";
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();

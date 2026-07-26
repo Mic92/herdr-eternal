@@ -35,6 +35,8 @@ pub enum ClientError {
     Protocol(#[from] proto::ProtocolError),
     #[error("server closed the connection unexpectedly")]
     ConnectionClosed,
+    #[error("timed out connecting to the server")]
+    ConnectTimeout,
     #[error("cannot fetch {url}: {source}")]
     Http {
         url: String,
@@ -69,10 +71,7 @@ impl TargetConfig {
             Some(token) => token.clone(),
             None => oidc::access_token(name, self).await?,
         };
-        Ok(Target {
-            url: self.url.clone(),
-            token,
-        })
+        Ok(Target::new(self.url.clone(), token))
     }
 }
 
@@ -81,6 +80,26 @@ impl TargetConfig {
 pub struct Target {
     pub url: String,
     pub token: String,
+    /// How often to send a WebSocket ping while attached.
+    pub keepalive_interval: std::time::Duration,
+    /// Treat the connection as dead when nothing (not even a pong) arrived
+    /// for this long; a silent drop then triggers the resume path.
+    pub keepalive_timeout: std::time::Duration,
+    /// Give up on a single connect/handshake attempt after this long, so a
+    /// blackholed reconnect does not eat the whole resume window.
+    pub connect_timeout: std::time::Duration,
+}
+
+impl Target {
+    pub fn new(url: String, token: String) -> Self {
+        Self {
+            url,
+            token,
+            keepalive_interval: std::time::Duration::from_secs(10),
+            keepalive_timeout: std::time::Duration::from_secs(30),
+            connect_timeout: std::time::Duration::from_secs(10),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +152,7 @@ pub async fn run_exec(
 ) -> Result<i32, ClientError> {
     let mut stdin = Some(stdin);
     let mut stdin_buf = [0_u8; 16 * 1024];
+    // Stdin the server has not acknowledged yet; resent verbatim on resume.
     let mut sent_stdin: Vec<proto::ChannelMessage> = Vec::new();
     let mut client_seq: u64 = 0;
     let mut last_server_seq: u64 = 0;
@@ -141,8 +161,11 @@ pub async fn run_exec(
     let mut resume_deadline: Option<tokio::time::Instant> = None;
 
     loop {
-        let mut ws = match connect_and_start(target, command, &resume_token, last_server_seq).await
-        {
+        let connect = tokio::time::timeout(
+            target.connect_timeout,
+            connect_and_start(target, command, &resume_token, last_server_seq),
+        );
+        let mut ws = match connect.await.unwrap_or(Err(ClientError::ConnectTimeout)) {
             Ok((ws, token)) => {
                 if resume_token.is_none() {
                     resume_token = token;
@@ -170,8 +193,22 @@ pub async fn run_exec(
                 }
             }
 
+            let mut keepalive = tokio::time::interval(target.keepalive_interval);
+            keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_activity = tokio::time::Instant::now();
+
             loop {
                 tokio::select! {
+                    _ = keepalive.tick() => {
+                        // A blackholed connection never errors; the missing
+                        // pong (or any other traffic) is what gives it away.
+                        if last_activity.elapsed() >= target.keepalive_timeout {
+                            return Ok(None);
+                        }
+                        if ws.send(Message::Ping(Vec::new())).await.is_err() {
+                            return Ok(None);
+                        }
+                    }
                     read = async { stdin.as_mut().unwrap().read(&mut stdin_buf).await }, if stdin.is_some() => {
                         let n = read?;
                         client_seq += 1;
@@ -187,19 +224,33 @@ pub async fn run_exec(
                         }
                     }
                     message = ws.next() => {
+                        last_activity = tokio::time::Instant::now();
                         match message {
                             Some(Ok(Message::Binary(bytes))) => match proto::decode(&bytes)? {
                                 proto::ChannelMessage::Stdout { seq, data } if seq > last_server_seq => {
                                     last_server_seq = seq;
                                     stdout.write_all(&data).await?;
                                     stdout.flush().await?;
+                                    ack(&mut ws, last_server_seq).await;
                                 }
                                 proto::ChannelMessage::Stderr { seq, data } if seq > last_server_seq => {
                                     last_server_seq = seq;
                                     stderr.write_all(&data).await?;
                                     stderr.flush().await?;
+                                    ack(&mut ws, last_server_seq).await;
                                 }
-                                proto::ChannelMessage::Exit { code, .. } => return Ok(Some(code)),
+                                proto::ChannelMessage::Exit { seq, code } => {
+                                    // Confirm delivery so the server can drop the session.
+                                    ack(&mut ws, seq).await;
+                                    return Ok(Some(code));
+                                }
+                                proto::ChannelMessage::Ack { seq: acked } => {
+                                    sent_stdin.retain(|message| match message {
+                                        proto::ChannelMessage::Stdin { seq, .. }
+                                        | proto::ChannelMessage::StdinEof { seq } => *seq > acked,
+                                        _ => true,
+                                    });
+                                }
                                 _ => {}
                             },
                             Some(Ok(Message::Close(_))) | None => return Ok(None),
@@ -221,6 +272,14 @@ pub async fn run_exec(
             Ok(None) => return Err(ClientError::ConnectionClosed),
             Err(err) => return Err(err),
         }
+    }
+}
+
+/// Tells the server which of its messages we have persisted, so it can trim
+/// its replay buffer. Failures surface on the next send/receive.
+async fn ack(ws: &mut Ws, seq: u64) {
+    if let Ok(bytes) = proto::encode(&proto::ChannelMessage::Ack { seq }) {
+        ws.send(Message::Binary(bytes)).await.ok();
     }
 }
 

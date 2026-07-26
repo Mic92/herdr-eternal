@@ -88,6 +88,8 @@ async fn exec_relays_stdio_and_exit_code() {
             proto::ChannelMessage::Stdout { data, .. } => stdout.extend(data),
             proto::ChannelMessage::Stderr { data, .. } => stderr.extend(data),
             proto::ChannelMessage::Exit { code, .. } => break code,
+            // Acknowledgement of applied stdin; irrelevant for this test.
+            proto::ChannelMessage::Ack { .. } => {}
             other => panic!("unexpected message: {other:?}"),
         }
     };

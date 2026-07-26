@@ -6,10 +6,11 @@
 //! survives a lost connection and a later `Resume { last_seq_seen }` replays
 //! everything the client has not seen yet, byte-exactly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use herdr_eternal_proto as proto;
@@ -81,25 +82,44 @@ impl Server {
     }
 }
 
-/// Outbound messages (Stdout/Stderr/Exit) of a session. Entry `i` carries
-/// sequence number `i + 1`, so replay after `last_seq_seen` is an index.
+/// Outbound messages (Stdout/Stderr/Exit) of a session, kept for replay after
+/// a resume. The entry at buffer index `i` carries sequence number
+/// `trimmed + i + 1`; entries the client acknowledged are dropped.
 #[derive(Default)]
 struct OutboundLog {
-    entries: Mutex<Vec<proto::ChannelMessage>>,
+    entries: Mutex<LogEntries>,
     latest: watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct LogEntries {
+    buffer: VecDeque<proto::ChannelMessage>,
+    /// Number of leading entries dropped after the client acknowledged them.
+    trimmed: u64,
 }
 
 impl OutboundLog {
     fn push(&self, message: proto::ChannelMessage) {
         let mut entries = self.entries.lock().unwrap();
-        entries.push(message);
-        let seq = entries.len() as u64;
+        entries.buffer.push_back(message);
+        let seq = entries.trimmed + entries.buffer.len() as u64;
         drop(entries);
         self.latest.send_replace(seq);
     }
 
     fn after(&self, seq: u64) -> Vec<proto::ChannelMessage> {
-        self.entries.lock().unwrap()[seq as usize..].to_vec()
+        let entries = self.entries.lock().unwrap();
+        let skip = seq.saturating_sub(entries.trimmed) as usize;
+        entries.buffer.iter().skip(skip).cloned().collect()
+    }
+
+    /// Drops entries up to and including `seq`; the client persisted them.
+    fn trim(&self, seq: u64) {
+        let mut entries = self.entries.lock().unwrap();
+        while entries.trimmed < seq && !entries.buffer.is_empty() {
+            entries.buffer.pop_front();
+            entries.trimmed += 1;
+        }
     }
 
     fn subscribe(&self) -> watch::Receiver<u64> {
@@ -116,6 +136,9 @@ enum SessionInput {
 struct Session {
     inbound: mpsc::UnboundedSender<SessionInput>,
     log: Arc<OutboundLog>,
+    /// Highest stdin sequence number the session task has applied; reported
+    /// back to the client so it can trim its resend buffer.
+    stdin_applied: Arc<AtomicU64>,
     resumable: bool,
 }
 
@@ -209,16 +232,24 @@ fn start_session(shell: &str, command: &str, resumable: bool) -> Result<Arc<Sess
 
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
     let log = Arc::new(OutboundLog::default());
+    let stdin_applied = Arc::new(AtomicU64::new(0));
     let session = Arc::new(Session {
         inbound: inbound_tx,
         log: Arc::clone(&log),
+        stdin_applied: Arc::clone(&stdin_applied),
         resumable,
     });
 
     // Kept in an Option so StdinEof can drop it: dropping closes the pipe and
     // is the only way the child sees EOF (AsyncWrite::shutdown does not).
     let child_stdin = child.stdin.take();
-    tokio::spawn(session_task(child, child_stdin, inbound_rx, log));
+    tokio::spawn(session_task(
+        child,
+        child_stdin,
+        inbound_rx,
+        log,
+        stdin_applied,
+    ));
     Ok(session)
 }
 
@@ -229,6 +260,7 @@ async fn session_task(
     mut child_stdin: Option<tokio::process::ChildStdin>,
     mut inbound: mpsc::UnboundedReceiver<SessionInput>,
     log: Arc<OutboundLog>,
+    stdin_applied: Arc<AtomicU64>,
 ) {
     let mut child_stdout = child.stdout.take().expect("piped stdout");
     let mut child_stderr = child.stderr.take().expect("piped stderr");
@@ -275,12 +307,14 @@ async fn session_task(
                                     child_stdin = None;
                                 }
                             }
+                            stdin_applied.store(last_client_seq, Ordering::Relaxed);
                         }
                     }
                     Some(SessionInput::Message(proto::ChannelMessage::StdinEof { seq })) => {
                         if seq > last_client_seq {
                             last_client_seq = seq;
                             child_stdin = None;
+                            stdin_applied.store(last_client_seq, Ordering::Relaxed);
                         }
                     }
                     Some(SessionInput::Message(other)) => {
@@ -326,29 +360,48 @@ async fn attach(
     )
     .await?;
 
+    // Detects clients that vanished without closing the connection (NAT
+    // timeout, suspend): ping regularly and give up when nothing comes back.
+    const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+    const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45);
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_activity = tokio::time::Instant::now();
+    // Last stdin ack sent to the client; only resent when it advances.
+    let mut acked_stdin: u64 = 0;
+    // Sequence number of the Exit message once it went out on this
+    // connection. The session is only removed when the client acknowledges
+    // it; a blackholed connection may lose the Exit and needs to resume.
+    let mut exit_seq: Option<u64> = None;
+
     let mut latest = session.log.subscribe();
     loop {
         for message in session.log.after(sent_up_to) {
-            let is_exit = matches!(message, proto::ChannelMessage::Exit { .. });
+            if let proto::ChannelMessage::Exit { seq, .. } = message {
+                exit_seq = Some(seq);
+            }
             send(&mut ws, &message).await?;
             sent_up_to += 1;
-            if is_exit {
-                sessions.remove(session_token);
-                ws.close(None).await.ok();
-                // Drain until the peer closes: dropping the socket with unread
-                // client data sends a TCP RST, which can discard the Exit
-                // frame before the client reads it.
-                while let Some(message) = ws.next().await {
-                    if message.is_err() {
-                        break;
-                    }
-                }
-                return Ok(());
-            }
+        }
+
+        let stdin_applied = session.stdin_applied.load(Ordering::Relaxed);
+        if stdin_applied > acked_stdin {
+            acked_stdin = stdin_applied;
+            send(&mut ws, &proto::ChannelMessage::Ack { seq: acked_stdin }).await?;
         }
 
         tokio::select! {
-            changed = latest.changed() => {
+            _ = keepalive.tick() => {
+                if last_activity.elapsed() >= KEEPALIVE_TIMEOUT {
+                    if !session.resumable {
+                        sessions.remove(session_token);
+                        session.inbound.send(SessionInput::Abort).ok();
+                    }
+                    return Ok(());
+                }
+                ws.send(Message::Ping(Vec::new())).await.map_err(Box::new)?;
+            }
+            changed = latest.changed(), if exit_seq.is_none() => {
                 if changed.is_err() && session.log.after(sent_up_to).is_empty() {
                     // Session task ended without an Exit message.
                     sessions.remove(session_token);
@@ -357,10 +410,23 @@ async fn attach(
                 }
             }
             message = ws.next() => {
+                last_activity = tokio::time::Instant::now();
                 match message {
                     Some(Ok(Message::Binary(bytes))) => {
-                        let message = proto::decode(&bytes)?;
-                        session.inbound.send(SessionInput::Message(message)).ok();
+                        match proto::decode(&bytes)? {
+                            proto::ChannelMessage::Ack { seq } => {
+                                session.log.trim(seq);
+                                if exit_seq.is_some_and(|exit| seq >= exit) {
+                                    // Exit delivered; the session is complete.
+                                    sessions.remove(session_token);
+                                    ws.close(None).await.ok();
+                                    return Ok(());
+                                }
+                            }
+                            message => {
+                                session.inbound.send(SessionInput::Message(message)).ok();
+                            }
+                        }
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         if !session.resumable {
@@ -403,5 +469,34 @@ async fn recv<T: serde::de::DeserializeOwned>(
             Some(Ok(_)) => continue,
             Some(Err(err)) => return Err(Box::new(err).into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbound_log_replays_after_trim() {
+        let log = OutboundLog::default();
+        for seq in 1..=3 {
+            log.push(proto::ChannelMessage::Stdout {
+                seq,
+                data: vec![seq as u8],
+            });
+        }
+
+        // The client acknowledged seq 2: those entries are dropped, and any
+        // replay can only return what is still buffered (seq 3).
+        log.trim(2);
+        for last_seen in [0, 2] {
+            let replay = log.after(last_seen);
+            assert_eq!(replay.len(), 1);
+            assert!(matches!(
+                replay[0],
+                proto::ChannelMessage::Stdout { seq: 3, .. }
+            ));
+        }
+        assert!(log.after(3).is_empty());
     }
 }
