@@ -40,11 +40,11 @@ invisible to herdr.
       location = "/herdr-eternal";
     };
     # Optional direct QUIC listener (roaming clients get connection
-    # migration); reuses the ACME cert nginx already has.
+    # migration); reuses the ACME cert nginx already has and restarts the
+    # service on renewal (sessions survive the restart).
     quic = {
       enable = true;
-      certFile = "/var/lib/acme/example.com/fullchain.pem";
-      keyFile = "/var/lib/acme/example.com/key.pem";
+      useACMEHost = "example.com";
     };
   };
 }
