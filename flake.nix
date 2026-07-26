@@ -21,6 +21,16 @@
         "aarch64-darwin"
       ];
       imports = [ inputs.treefmt-nix.flakeModule ];
+
+      flake.nixosModules.default =
+        { pkgs, lib, ... }:
+        {
+          imports = [ ./nix/module.nix ];
+          services.herdr-eternal-server.package =
+            lib.mkDefault
+              inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
+
       perSystem =
         { pkgs, ... }:
         let
@@ -64,6 +74,14 @@
                 nativeCheckInputs = [ herdrPatched ];
               }
             );
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            # Full deployment path: NixOS module, nginx WebSocket proxying,
+            # client exec through the proxy.
+            nixos = pkgs.callPackage ./nix/nixos-test.nix {
+              nixosModule = inputs.self.nixosModules.default;
+              package = workspace;
+            };
           };
 
           devShells.default = craneLib.devShell {
