@@ -7,13 +7,13 @@ use herdr_eternal_server::{Auth, OidcConfig, Server};
 const CLIENT_ID: &str = "herdr-eternal";
 const ALLOWED_SUB: &str = "joerg";
 
-async fn start_server(issuer: &FakeIssuer) -> std::net::SocketAddr {
+async fn start_server(issuer: &FakeIssuer, allowed_sub: &str) -> std::net::SocketAddr {
     let auth = Auth::new(
         Some("static-secret".into()),
         Some(OidcConfig {
             issuer: issuer.issuer_url(),
             client_id: CLIENT_ID.into(),
-            allowed_sub: ALLOWED_SUB.into(),
+            allowed_sub: allowed_sub.into(),
         }),
     );
     let server = Server::bind("127.0.0.1:0", auth, "/bin/sh".into())
@@ -56,7 +56,7 @@ async fn handshake_accepted(addr: std::net::SocketAddr, token: &str) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oidc_bearer_tokens_are_validated() {
     let issuer = FakeIssuer::start().await;
-    let addr = start_server(&issuer).await;
+    let addr = start_server(&issuer, ALLOWED_SUB).await;
 
     // The static token keeps working alongside OIDC.
     assert!(handshake_accepted(addr, "static-secret").await);
@@ -74,6 +74,13 @@ async fn oidc_bearer_tokens_are_validated() {
     assert!(!handshake_accepted(addr, &expired).await);
 
     assert!(!handshake_accepted(addr, "not-a-jwt").await);
+
+    // client_credentials tokens carry no sub, only client_id; they only
+    // authenticate a server whose allowed sub is that client id.
+    let machine_token = issuer.client_credentials_token(CLIENT_ID);
+    assert!(!handshake_accepted(addr, &machine_token).await);
+    let machine_addr = start_server(&issuer, CLIENT_ID).await;
+    assert!(handshake_accepted(machine_addr, &machine_token).await);
 
     // Tokens signed by a different issuer (unknown key) are rejected.
     let other_issuer = FakeIssuer::start().await;

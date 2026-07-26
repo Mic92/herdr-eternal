@@ -37,7 +37,10 @@ struct DeviceFlow {
 #[derive(serde::Serialize)]
 struct Claims {
     iss: String,
-    sub: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
     aud: String,
     exp: u64,
     iat: u64,
@@ -108,7 +111,13 @@ impl FakeIssuer {
     /// Mints a signed token; `expires_in` may be negative to produce an
     /// already-expired token.
     pub fn token(&self, sub: &str, audience: &str, expires_in_secs: i64) -> String {
-        self.inner.token(sub, audience, expires_in_secs)
+        self.inner.token(Some(sub), audience, expires_in_secs)
+    }
+
+    /// Mints a client_credentials-style token: no `sub`, only `client_id`
+    /// (matching e.g. Authelia's behaviour).
+    pub fn client_credentials_token(&self, client_id: &str) -> String {
+        self.inner.token(None, client_id, 300)
     }
 }
 
@@ -117,14 +126,15 @@ impl Inner {
         format!("http://{}", self.addr)
     }
 
-    fn token(&self, sub: &str, audience: &str, expires_in_secs: i64) -> String {
+    fn token(&self, sub: Option<&str>, audience: &str, expires_in_secs: i64) -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock after epoch")
             .as_secs();
         let claims = Claims {
             iss: self.issuer_url(),
-            sub: sub.to_string(),
+            sub: sub.map(str::to_string),
+            client_id: sub.is_none().then(|| audience.to_string()),
             aud: audience.to_string(),
             exp: now.saturating_add_signed(expires_in_secs),
             iat: now,
@@ -191,7 +201,7 @@ async fn token_grant(
     };
 
     axum::Json(serde_json::json!({
-        "access_token": inner.token(&sub, &client_id, 3600),
+        "access_token": inner.token(Some(&sub), &client_id, 3600),
         "token_type": "Bearer",
         "expires_in": 3600,
         "refresh_token": REFRESH_TOKEN,

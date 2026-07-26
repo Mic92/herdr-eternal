@@ -82,6 +82,11 @@
               nixosModule = inputs.self.nixosModules.default;
               package = workspace;
             };
+            # Compatibility with a real OIDC provider.
+            nixos-authelia = pkgs.callPackage ./nix/nixos-test-authelia.nix {
+              nixosModule = inputs.self.nixosModules.default;
+              package = workspace;
+            };
           };
 
           devShells.default = craneLib.devShell {

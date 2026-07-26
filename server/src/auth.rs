@@ -22,6 +22,8 @@ pub enum AuthError {
     UnknownKey,
     #[error("token subject {0:?} is not allowed")]
     SubNotAllowed(String),
+    #[error("token has no subject")]
+    MissingSub,
 }
 
 /// OIDC validation settings.
@@ -90,7 +92,10 @@ struct Discovery {
 
 #[derive(Deserialize)]
 struct Claims {
-    sub: String,
+    sub: Option<String>,
+    /// Some providers (e.g. Authelia) omit `sub` for client_credentials
+    /// grants and only set `client_id`.
+    client_id: Option<String>,
 }
 
 impl Oidc {
@@ -103,8 +108,15 @@ impl Oidc {
         validation.set_audience(&[&self.config.client_id]);
         let claims = jsonwebtoken::decode::<Claims>(token, &key, &validation)?.claims;
 
-        if claims.sub != self.config.allowed_sub {
-            return Err(AuthError::SubNotAllowed(claims.sub));
+        // The subject identifies the user; tokens from the client_credentials
+        // grant may only carry client_id, which requires the client secret to
+        // obtain and therefore also identifies a single principal.
+        let subject = claims
+            .sub
+            .or(claims.client_id)
+            .ok_or(AuthError::MissingSub)?;
+        if subject != self.config.allowed_sub {
+            return Err(AuthError::SubNotAllowed(subject));
         }
         Ok(())
     }
