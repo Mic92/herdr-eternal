@@ -84,6 +84,8 @@ async fn forward(
     mode: watch::Receiver<Mode>,
     mut generation: watch::Receiver<u64>,
 ) {
+    // Only future sever() calls concern this connection; past ones are stale.
+    generation.borrow_and_update();
     let (client_read, client_write) = client.into_split();
     let (server_read, server_write) = server.into_split();
     let upload = tokio::spawn(pump(client_read, server_write, mode.clone()));

@@ -1,8 +1,6 @@
 //! M3: the exec channel must survive a netsplit between client and server
 //! without losing or duplicating bytes (see PLAN.md, application-level resume).
 //!
-//! Red test for the resume implementation; remove #[ignore] once client and
-//! server support Resume { last_seq_seen }.
 
 mod support;
 
@@ -13,7 +11,6 @@ use herdr_eternal_ssh::{Target, run_exec};
 use support::proxy::FlakyProxy;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "resume is not implemented yet (M3)"]
 async fn exec_survives_severed_connection() {
     let server = Server::bind("127.0.0.1:0", "secret".into(), "/bin/sh".into())
         .await

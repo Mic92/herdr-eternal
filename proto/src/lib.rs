@@ -65,9 +65,6 @@ pub enum ChannelMessage {
     Stderr { seq: u64, data: Vec<u8> },
     /// Server -> client: process finished.
     Exit { seq: u64, code: i32 },
-    /// Either direction: acknowledge received sequence numbers so the peer
-    /// can trim its replay buffer.
-    Ack { last_seq_seen: u64 },
 }
 
 pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, ProtocolError> {

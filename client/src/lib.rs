@@ -9,6 +9,7 @@ use herdr_eternal_proto as proto;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -74,7 +75,16 @@ pub fn default_config_path() -> PathBuf {
     base.join("herdr-eternal").join("config.toml")
 }
 
+/// How long a disconnected exec keeps trying to resume before giving up.
+const RESUME_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const RESUME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Runs `command` on the target and relays stdio; returns the remote exit code.
+///
+/// The exec is resumable: if the connection drops, the client reconnects and
+/// resumes the same session with `Resume { last_seq_seen }`. Sent stdin is
+/// kept for resend (the server deduplicates by sequence number), so the
+/// stream stays byte-exact in both directions across reconnects.
 pub async fn run_exec(
     target: &Target,
     command: &str,
@@ -82,6 +92,108 @@ pub async fn run_exec(
     mut stdout: impl AsyncWrite + Unpin,
     mut stderr: impl AsyncWrite + Unpin,
 ) -> Result<i32, ClientError> {
+    let mut stdin = Some(stdin);
+    let mut stdin_buf = [0_u8; 16 * 1024];
+    let mut sent_stdin: Vec<proto::ChannelMessage> = Vec::new();
+    let mut client_seq: u64 = 0;
+    let mut last_server_seq: u64 = 0;
+    let mut resume_token: Option<String> = None;
+    // Set on disconnect; bounds how long we keep trying to resume afterwards.
+    let mut resume_deadline: Option<tokio::time::Instant> = None;
+
+    loop {
+        let mut ws = match connect_and_start(target, command, &resume_token, last_server_seq).await
+        {
+            Ok((ws, token)) => {
+                if resume_token.is_none() {
+                    resume_token = token;
+                }
+                ws
+            }
+            Err(err) => {
+                // resume_deadline is only set after a resumable session dropped.
+                match resume_deadline {
+                    Some(deadline) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(RESUME_RETRY_DELAY).await;
+                        continue;
+                    }
+                    _ => return Err(err),
+                }
+            }
+        };
+
+        let attached = async {
+            // Resend stdin the server may not have seen; it deduplicates by seq.
+            // Send failures are disconnects and handled by the resume loop.
+            for message in &sent_stdin {
+                if send(&mut ws, message).await.is_err() {
+                    return Ok(None);
+                }
+            }
+
+            loop {
+                tokio::select! {
+                    read = async { stdin.as_mut().unwrap().read(&mut stdin_buf).await }, if stdin.is_some() => {
+                        let n = read?;
+                        client_seq += 1;
+                        let message = if n == 0 {
+                            stdin = None;
+                            proto::ChannelMessage::StdinEof { seq: client_seq }
+                        } else {
+                            proto::ChannelMessage::Stdin { seq: client_seq, data: stdin_buf[..n].to_vec() }
+                        };
+                        sent_stdin.push(message.clone());
+                        if send(&mut ws, &message).await.is_err() {
+                            return Ok(None);
+                        }
+                    }
+                    message = ws.next() => {
+                        match message {
+                            Some(Ok(Message::Binary(bytes))) => match proto::decode(&bytes)? {
+                                proto::ChannelMessage::Stdout { seq, data } if seq > last_server_seq => {
+                                    last_server_seq = seq;
+                                    stdout.write_all(&data).await?;
+                                    stdout.flush().await?;
+                                }
+                                proto::ChannelMessage::Stderr { seq, data } if seq > last_server_seq => {
+                                    last_server_seq = seq;
+                                    stderr.write_all(&data).await?;
+                                    stderr.flush().await?;
+                                }
+                                proto::ChannelMessage::Exit { code, .. } => return Ok(Some(code)),
+                                _ => {}
+                            },
+                            Some(Ok(Message::Close(_))) | None => return Ok(None),
+                            Some(Ok(_)) => {}
+                            Some(Err(_)) => return Ok(None),
+                        }
+                    }
+                }
+            }
+        };
+
+        match attached.await {
+            Ok(Some(code)) => return Ok(code),
+            // Disconnected mid-exec: resume if the server handed out a token.
+            Ok(None) if resume_token.is_some() => {
+                resume_deadline = Some(tokio::time::Instant::now() + RESUME_WINDOW);
+                tokio::time::sleep(RESUME_RETRY_DELAY).await;
+            }
+            Ok(None) => return Err(ClientError::ConnectionClosed),
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Connects, authenticates, and starts or resumes the exec session.
+async fn connect_and_start(
+    target: &Target,
+    command: &str,
+    resume_token: &Option<String>,
+    last_server_seq: u64,
+) -> Result<(Ws, Option<String>), ClientError> {
     let (mut ws, _) = tokio_tungstenite::connect_async(&target.url)
         .await
         .map_err(Box::new)?;
@@ -97,55 +209,22 @@ pub async fn run_exec(
     .await?;
     let _welcome: proto::Welcome = recv(&mut ws).await?;
 
-    send(
-        &mut ws,
-        &proto::ExecRequest::Exec {
-            command: command.to_string(),
-            resumable: false,
+    let request = match resume_token {
+        Some(resume_token) => proto::ExecRequest::Resume {
+            resume_token: resume_token.clone(),
+            last_seq_seen: last_server_seq,
         },
-    )
-    .await?;
-    let proto::ChannelMessage::Started { .. } = recv(&mut ws).await? else {
+        None => proto::ExecRequest::Exec {
+            command: command.to_string(),
+            resumable: true,
+        },
+    };
+    send(&mut ws, &request).await?;
+
+    let proto::ChannelMessage::Started { resume_token } = recv(&mut ws).await? else {
         return Err(ClientError::ConnectionClosed);
     };
-
-    let mut stdin = Some(stdin);
-    let mut stdin_buf = [0_u8; 16 * 1024];
-    let mut seq: u64 = 0;
-
-    loop {
-        tokio::select! {
-            read = async { stdin.as_mut().unwrap().read(&mut stdin_buf).await }, if stdin.is_some() => {
-                let n = read?;
-                seq += 1;
-                if n == 0 {
-                    stdin = None;
-                    send(&mut ws, &proto::ChannelMessage::StdinEof { seq }).await?;
-                } else {
-                    send(&mut ws, &proto::ChannelMessage::Stdin { seq, data: stdin_buf[..n].to_vec() }).await?;
-                }
-            }
-            message = ws.next() => {
-                match message {
-                    Some(Ok(Message::Binary(bytes))) => match proto::decode(&bytes)? {
-                        proto::ChannelMessage::Stdout { data, .. } => {
-                            stdout.write_all(&data).await?;
-                            stdout.flush().await?;
-                        }
-                        proto::ChannelMessage::Stderr { data, .. } => {
-                            stderr.write_all(&data).await?;
-                            stderr.flush().await?;
-                        }
-                        proto::ChannelMessage::Exit { code, .. } => return Ok(code),
-                        _ => {}
-                    },
-                    Some(Ok(Message::Close(_))) | None => return Err(ClientError::ConnectionClosed),
-                    Some(Ok(_)) => {}
-                    Some(Err(err)) => return Err(Box::new(err).into()),
-                }
-            }
-        }
-    }
+    Ok((ws, resume_token))
 }
 
 async fn send<S, T>(ws: &mut S, msg: &T) -> Result<(), ClientError>
