@@ -7,6 +7,7 @@
 //! everything the client has not seen yet, byte-exactly.
 
 use std::collections::{HashMap, VecDeque};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use herdr_eternal_proto as proto;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::pipe;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::WebSocketStream;
@@ -382,7 +384,30 @@ fn session_environment(cmd: &mut tokio::process::Command, shell: &str) {
     }
 }
 
-/// Spawns the child and the session task that owns it.
+/// The pipes of a running session and, when this daemon spawned it, the
+/// child handle used to reap the wrapper. Everything is fd-based so a session
+/// reclaimed from the systemd fd store looks the same as a fresh one.
+struct SessionIo {
+    /// Kept in an Option so StdinEof can drop it: dropping closes the pipe
+    /// and is the only way the child sees EOF.
+    stdin: Option<pipe::Sender>,
+    stdout: pipe::Receiver,
+    stderr: pipe::Receiver,
+    /// Carries the command's exit code, written by the /bin/sh wrapper; the
+    /// daemon is not necessarily the child's parent (after a restart), so
+    /// wait() cannot be relied on for the status.
+    exit: pipe::Receiver,
+    child: Option<tokio::process::Child>,
+    /// The session's process group, used to abort it.
+    pgid: nix::unistd::Pid,
+}
+
+/// Spawns the command and the session task that owns it.
+///
+/// The command runs under a small /bin/sh wrapper in its own process group;
+/// the wrapper reports the exit code over a dedicated pipe (fd 3) so it is
+/// still available when this daemon has been restarted and is no longer the
+/// parent of the child.
 fn start_session(
     shell: &str,
     command: &str,
@@ -390,18 +415,52 @@ fn start_session(
     agent: Option<Arc<agent::AgentHub>>,
     session_env: &[(String, String)],
 ) -> Result<Arc<Session>, ServerError> {
-    let mut cmd = tokio::process::Command::new(shell);
+    // All stdio goes through explicit pipes (not Stdio::piped) so the parent
+    // ends are plain fds that can be pushed into the systemd fd store.
+    let (stdin_read, stdin_write) = std::io::pipe()?;
+    let (stdout_read, stdout_write) = std::io::pipe()?;
+    let (stderr_read, stderr_write) = std::io::pipe()?;
+    let (exit_read, exit_write) = std::io::pipe()?;
+    let mut cmd = tokio::process::Command::new("/bin/sh");
     cmd.arg("-c")
+        // fd 3 is closed for the command itself so only the wrapper holds it.
+        .arg(r#""$0" -c "$1" 3>&-; echo "$?" >&3"#)
+        .arg(shell)
         .arg(command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdin(Stdio::from(stdin_read))
+        .stdout(Stdio::from(stdout_write))
+        .stderr(Stdio::from(stderr_write))
+        .process_group(0);
     session_environment(&mut cmd, shell);
     cmd.envs(session_env.iter().map(|(key, value)| (key, value)));
     if let Some(agent) = &agent {
         cmd.env("SSH_AUTH_SOCK", agent.socket_path());
     }
-    let mut child = cmd.spawn()?;
+    let exit_fd = exit_write.as_raw_fd();
+    // SAFETY: dup2 is async-signal-safe; the closure only duplicates the exit
+    // pipe onto fd 3 (which also clears its close-on-exec flag).
+    unsafe {
+        cmd.pre_exec(move || {
+            nix::unistd::dup2(exit_fd, 3)
+                .map(drop)
+                .map_err(std::io::Error::from)
+        });
+    }
+    let child = cmd.spawn()?;
+    // The child's ends live on in the child; the parent must not hold them or
+    // it would never observe EOF.
+    drop(cmd);
+    drop(exit_write);
+
+    let pgid = nix::unistd::Pid::from_raw(child.id().unwrap_or_default() as i32);
+    let io = SessionIo {
+        stdin: Some(pipe::Sender::from_owned_fd(OwnedFd::from(stdin_write))?),
+        stdout: pipe::Receiver::from_owned_fd(OwnedFd::from(stdout_read))?,
+        stderr: pipe::Receiver::from_owned_fd(OwnedFd::from(stderr_read))?,
+        exit: pipe::Receiver::from_owned_fd(OwnedFd::from(exit_read))?,
+        child: Some(child),
+        pgid,
+    };
 
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
     let log = Arc::new(OutboundLog::default());
@@ -416,30 +475,52 @@ fn start_session(
         resumable,
     });
 
-    // Kept in an Option so StdinEof can drop it: dropping closes the pipe and
-    // is the only way the child sees EOF (AsyncWrite::shutdown does not).
-    let child_stdin = child.stdin.take();
-    tokio::spawn(session_task(
-        child,
-        child_stdin,
-        inbound_rx,
-        log,
-        stdin_applied,
-    ));
+    tokio::spawn(session_task(io, inbound_rx, log, stdin_applied));
     Ok(session)
+}
+
+/// The exit code reported by the wrapper, or 255 if it died without one.
+async fn read_exit_code(mut exit: pipe::Receiver) -> i32 {
+    let mut line = Vec::new();
+    let mut buf = [0_u8; 16];
+    while !line.contains(&b'\n') {
+        match exit.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => line.extend_from_slice(&buf[..n]),
+        }
+    }
+    String::from_utf8_lossy(&line).trim().parse().unwrap_or(255)
+}
+
+/// Kills the session's process group and reaps the wrapper if it is ours.
+async fn abort_session(pgid: nix::unistd::Pid, child: &mut Option<tokio::process::Child>) {
+    // Never signal pgid 0: that would be our own process group.
+    if pgid.as_raw() > 0 {
+        nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL).ok();
+    }
+    if let Some(child) = child {
+        child.wait().await.ok();
+    }
 }
 
 /// Owns the child process: pumps its stdout/stderr into the outbound log and
 /// applies deduplicated stdin from whichever connection is currently attached.
 async fn session_task(
-    mut child: tokio::process::Child,
-    mut child_stdin: Option<tokio::process::ChildStdin>,
+    io: SessionIo,
     mut inbound: mpsc::UnboundedReceiver<SessionInput>,
     log: Arc<OutboundLog>,
     stdin_applied: Arc<AtomicU64>,
 ) {
-    let mut child_stdout = child.stdout.take().expect("piped stdout");
-    let mut child_stderr = child.stderr.take().expect("piped stderr");
+    let SessionIo {
+        mut stdin,
+        mut stdout,
+        mut stderr,
+        exit,
+        mut child,
+        pgid,
+    } = io;
+    let exit_status = read_exit_code(exit);
+    tokio::pin!(exit_status);
     let mut stdout_buf = [0_u8; 16 * 1024];
     let mut stderr_buf = [0_u8; 16 * 1024];
     let mut stdout_open = true;
@@ -452,7 +533,7 @@ async fn session_task(
 
     loop {
         tokio::select! {
-            read = child_stdout.read(&mut stdout_buf), if stdout_open => {
+            read = stdout.read(&mut stdout_buf), if stdout_open => {
                 match read {
                     Ok(0) | Err(_) => stdout_open = false,
                     Ok(n) => {
@@ -461,7 +542,7 @@ async fn session_task(
                     }
                 }
             }
-            read = child_stderr.read(&mut stderr_buf), if stderr_open => {
+            read = stderr.read(&mut stderr_buf), if stderr_open => {
                 match read {
                     Ok(0) | Err(_) => stderr_open = false,
                     Ok(n) => {
@@ -470,17 +551,21 @@ async fn session_task(
                     }
                 }
             }
-            status = child.wait(), if exit_code.is_none() => {
-                exit_code = Some(status.map(|s| s.code().unwrap_or(255)).unwrap_or(255));
+            code = &mut exit_status, if exit_code.is_none() => {
+                exit_code = Some(code);
+                // Reap the wrapper when this daemon is its parent.
+                if let Some(child) = child.as_mut() {
+                    child.wait().await.ok();
+                }
             }
             input = inbound.recv() => {
                 match input {
                     Some(SessionInput::Message(proto::ChannelMessage::Stdin { seq, data })) => {
                         if seq > last_client_seq {
                             last_client_seq = seq;
-                            if let Some(stdin) = child_stdin.as_mut() {
-                                if stdin.write_all(&data).await.is_err() || stdin.flush().await.is_err() {
-                                    child_stdin = None;
+                            if let Some(pipe) = stdin.as_mut() {
+                                if pipe.write_all(&data).await.is_err() || pipe.flush().await.is_err() {
+                                    stdin = None;
                                 }
                             }
                             stdin_applied.store(last_client_seq, Ordering::Relaxed);
@@ -489,7 +574,7 @@ async fn session_task(
                     Some(SessionInput::Message(proto::ChannelMessage::StdinEof { seq })) => {
                         if seq > last_client_seq {
                             last_client_seq = seq;
-                            child_stdin = None;
+                            stdin = None;
                             stdin_applied.store(last_client_seq, Ordering::Relaxed);
                         }
                     }
@@ -497,12 +582,12 @@ async fn session_task(
                         debug!(?other, "ignoring unexpected channel message");
                     }
                     Some(SessionInput::Abort) => {
-                        child.start_kill().ok();
+                        abort_session(pgid, &mut child).await;
                         return;
                     }
                     None => {
                         // All connections and the registry dropped the session.
-                        child.start_kill().ok();
+                        abort_session(pgid, &mut child).await;
                         return;
                     }
                 }
