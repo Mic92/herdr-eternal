@@ -11,6 +11,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+pub mod oidc;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("cannot read config {path}: {source}")]
@@ -33,24 +35,61 @@ pub enum ClientError {
     Protocol(#[from] proto::ProtocolError),
     #[error("server closed the connection unexpectedly")]
     ConnectionClosed,
+    #[error("cannot fetch {url}: {source}")]
+    Http {
+        url: String,
+        source: Box<reqwest::Error>,
+    },
+    #[error("oidc error: {0}")]
+    Oidc(String),
+    #[error("not logged in to {0}; run: herdr-eternal-ssh login {0}")]
+    NotLoggedIn(String),
+    #[error("target has neither a token nor issuer/client_id configured")]
+    NoAuthConfigured,
 }
 
 /// Per-target connection settings, `[targets.<name>]` in the config file.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Target {
+pub struct TargetConfig {
     /// WebSocket endpoint, e.g. `wss://host/herdr-eternal` or `ws://127.0.0.1:8422`.
     pub url: String,
-    /// Pre-shared token (M1; replaced by OIDC in M2).
+    /// Pre-shared token; alternative to OIDC.
+    pub token: Option<String>,
+    /// OIDC issuer URL; enables `herdr-eternal-ssh login <target>`.
+    pub issuer: Option<String>,
+    /// OAuth client id used for the device-code flow.
+    pub client_id: Option<String>,
+}
+
+impl TargetConfig {
+    /// Resolves the token to present: the static token if configured,
+    /// otherwise a cached/refreshed OIDC access token.
+    pub async fn resolve(&self, name: &str) -> Result<Target, ClientError> {
+        let token = match &self.token {
+            Some(token) => token.clone(),
+            None => oidc::access_token(name, self).await?,
+        };
+        Ok(Target {
+            url: self.url.clone(),
+            token,
+        })
+    }
+}
+
+/// Connection parameters with a resolved authentication token.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub url: String,
     pub token: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    targets: HashMap<String, Target>,
+    targets: HashMap<String, TargetConfig>,
 }
 
 /// Looks up `target` in the TOML config file.
-pub fn load_target(path: &Path, target: &str) -> Result<Target, ClientError> {
+pub fn load_target(path: &Path, target: &str) -> Result<TargetConfig, ClientError> {
     let contents = std::fs::read_to_string(path).map_err(|source| ClientError::ReadConfig {
         path: path.to_path_buf(),
         source,
@@ -269,7 +308,8 @@ mod tests {
 
         let target = load_target(&path, "workbox").unwrap();
         assert_eq!(target.url, "ws://127.0.0.1:8422");
-        assert_eq!(target.token, "secret");
+        assert_eq!(target.token.as_deref(), Some("secret"));
+        assert_eq!(target.issuer, None);
 
         assert!(matches!(
             load_target(&path, "other"),

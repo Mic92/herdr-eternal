@@ -9,7 +9,9 @@ description = "ssh-argument-compatible client for herdr --remote over the herdr-
 [dependencies]
 herdr-eternal-proto = { workspace = true }
 futures-util = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
@@ -18,5 +20,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-herdr-eternal-server = { path = "../server" }
+herdr-eternal-server = { path = "../server", features = ["test-util"] }
 tempfile = { workspace = true }

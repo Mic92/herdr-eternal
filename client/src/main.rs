@@ -5,7 +5,7 @@
 
 use std::process::ExitCode;
 
-use herdr_eternal_ssh::{ClientError, default_config_path, load_target, run_exec};
+use herdr_eternal_ssh::{ClientError, default_config_path, load_target, oidc, run_exec};
 
 /// The subset of ssh's command line that herdr emits.
 #[derive(Debug, PartialEq, Eq)]
@@ -49,8 +49,25 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    let Some(args) = parse_ssh_args(std::env::args().skip(1)) else {
+    let mut raw_args = std::env::args().skip(1).peekable();
+    if raw_args.peek().map(String::as_str) == Some("login") {
+        raw_args.next();
+        let Some(target) = raw_args.next() else {
+            eprintln!("usage: herdr-eternal-ssh login <target>");
+            return ExitCode::FAILURE;
+        };
+        return match login(&target) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("herdr-eternal-ssh: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let Some(args) = parse_ssh_args(raw_args) else {
         eprintln!("usage: herdr-eternal-ssh [ssh options] -T <target> <command>");
+        eprintln!("       herdr-eternal-ssh login <target>");
         return ExitCode::FAILURE;
     };
     let Some(command) = args.command else {
@@ -67,16 +84,26 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(target: &str, command: &str) -> Result<i32, ClientError> {
-    let target = load_target(&default_config_path(), target)?;
+fn login(name: &str) -> Result<(), ClientError> {
+    let config = load_target(&default_config_path(), name)?;
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(run_exec(
-        &target,
-        command,
-        tokio::io::stdin(),
-        tokio::io::stdout(),
-        tokio::io::stderr(),
-    ))
+    runtime.block_on(oidc::login(name, &config))
+}
+
+fn run(name: &str, command: &str) -> Result<i32, ClientError> {
+    let config = load_target(&default_config_path(), name)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let target = config.resolve(name).await?;
+        run_exec(
+            &target,
+            command,
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+            tokio::io::stderr(),
+        )
+        .await
+    })
 }
 
 #[cfg(test)]
