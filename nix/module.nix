@@ -96,9 +96,14 @@ in
         # The service signals readiness once the socket-activated listener
         # is being served, so dependent units never race the daemon.
         Type = "notify";
-        # Stable location for the forwarded SSH agent socket.
+        # Agent socket and handed-over session state, kept across restarts.
         RuntimeDirectory = "herdr-eternal-server";
         RuntimeDirectoryMode = "0700";
+        RuntimeDirectoryPreserve = true;
+        # Sessions survive restarts: keep their children alive and their
+        # pipe fds in the fd store until the next instance reclaims them.
+        KillMode = "process";
+        FileDescriptorStoreMax = 256;
         ExecStart = lib.concatStringsSep " " (
           [ (lib.getExe' cfg.package "herdr-eternal-server") ]
           ++ lib.optional (cfg.tokenFile != null) "--token-file %d/token"

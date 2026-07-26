@@ -66,6 +66,25 @@ pkgs.testers.runNixOSTest {
     # Exit codes must be propagated through nginx as well.
     machine.fail("herdr-eternal-ssh -T testbox 'exit 3' < /dev/null")
 
+    # A restart mid-session must lose neither output nor the exit code
+    # (handover through the systemd fd store).
+    machine.succeed(
+        "cat > /root/restart-client.sh <<'EOF'\n"
+        "${package}/bin/herdr-eternal-ssh -T testbox 'echo before; sleep 5; echo after; exit 5' </dev/null > /root/restart-out\n"
+        "echo rc=$? >> /root/restart-out\n"
+        "EOF",
+        "systemd-run --unit=restart-client --setenv=HOME=/root sh /root/restart-client.sh",
+    )
+    machine.wait_until_succeeds("grep -q before /root/restart-out", timeout=30)
+    old_pid = machine.succeed("systemctl show -p MainPID --value herdr-eternal-server").strip()
+    machine.succeed("systemctl restart herdr-eternal-server")
+    new_pid = machine.succeed("systemctl show -p MainPID --value herdr-eternal-server").strip()
+    assert old_pid != new_pid, f"daemon did not restart: {old_pid} vs {new_pid}"
+    machine.wait_until_succeeds("grep -q rc= /root/restart-out", timeout=60)
+    restart_out = machine.succeed("cat /root/restart-out")
+    assert restart_out == "before\nafter\nrc=5\n", repr(restart_out)
+    machine.succeed("journalctl -u herdr-eternal-server | grep -q 'restored handed-over session'")
+
     # Real ssh must be able to authenticate via the forwarded agent: the key
     # only exists in root's local agent, the session runs as alice.
     machine.succeed(
