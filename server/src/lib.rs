@@ -21,6 +21,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
+mod agent;
 mod auth;
 pub use auth::{Auth, AuthError, OidcConfig};
 #[cfg(feature = "test-util")]
@@ -40,6 +41,8 @@ pub enum ServerError {
     Auth(#[from] AuthError),
     #[error("unknown resume token")]
     UnknownResumeToken,
+    #[error("agent forwarding was not requested for this session")]
+    AgentNotEnabled,
     #[error("session ended without an exit code")]
     SessionAborted,
 }
@@ -151,6 +154,8 @@ struct Session {
     /// Highest stdin sequence number the session task has applied; reported
     /// back to the client so it can trim its resend buffer.
     stdin_applied: Arc<AtomicU64>,
+    /// Present when the client asked for agent forwarding.
+    agent: Option<Arc<agent::AgentHub>>,
     /// Number of currently attached connections (a lingering blackholed
     /// connection can overlap with its own resume).
     attached: AtomicUsize,
@@ -265,9 +270,13 @@ async fn handle_connection(
     .await?;
 
     let (session_token, session, last_seq_seen) = match recv(&mut ws).await? {
-        proto::ExecRequest::Exec { command, resumable } => {
-            debug!(%command, resumable, "exec");
-            let session = start_session(shell, &command, resumable)?;
+        proto::ExecRequest::Exec {
+            command,
+            resumable,
+            forward_agent,
+        } => {
+            debug!(%command, resumable, forward_agent, "exec");
+            let session = start_session(shell, &command, resumable, forward_agent)?;
             let session_token = new_resume_token();
             sessions.insert(session_token.clone(), Arc::clone(&session));
             (session_token, session, 0)
@@ -283,20 +292,45 @@ async fn handle_connection(
             };
             (resume_token, session, last_seq_seen)
         }
+        proto::ExecRequest::AgentChannel { resume_token } => {
+            debug!(%resume_token, "agent channel");
+            let Some(session) = sessions.get(&resume_token) else {
+                ws.close(None).await.ok();
+                return Err(ServerError::UnknownResumeToken);
+            };
+            let Some(hub) = session.agent.clone() else {
+                ws.close(None).await.ok();
+                return Err(ServerError::AgentNotEnabled);
+            };
+            // Keep the session attached while its agent channel is, so it is
+            // not expired away underneath a purely idle (but connected) client.
+            let _attached = AttachGuard::new(session);
+            return agent::handle_agent_channel(ws, hub).await;
+        }
     };
 
     attach(ws, &sessions, &session_token, session, last_seq_seen).await
 }
 
 /// Spawns the child and the session task that owns it.
-fn start_session(shell: &str, command: &str, resumable: bool) -> Result<Arc<Session>, ServerError> {
-    let mut child = tokio::process::Command::new(shell)
-        .arg("-c")
+fn start_session(
+    shell: &str,
+    command: &str,
+    resumable: bool,
+    forward_agent: bool,
+) -> Result<Arc<Session>, ServerError> {
+    let agent = forward_agent.then(agent::AgentHub::start).transpose()?;
+
+    let mut cmd = tokio::process::Command::new(shell);
+    cmd.arg("-c")
         .arg(command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    if let Some(agent) = &agent {
+        cmd.env("SSH_AUTH_SOCK", agent.socket_path());
+    }
+    let mut child = cmd.spawn()?;
 
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
     let log = Arc::new(OutboundLog::default());
@@ -305,6 +339,7 @@ fn start_session(shell: &str, command: &str, resumable: bool) -> Result<Arc<Sess
         inbound: inbound_tx,
         log: Arc::clone(&log),
         stdin_applied: Arc::clone(&stdin_applied),
+        agent,
         attached: AtomicUsize::new(0),
         detached_at: Mutex::new(Some(tokio::time::Instant::now())),
         resumable,

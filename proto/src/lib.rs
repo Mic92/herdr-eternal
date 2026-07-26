@@ -42,12 +42,18 @@ pub enum ExecRequest {
         command: String,
         /// Ask the server to keep the session resumable after disconnects.
         resumable: bool,
+        /// Ask the server to expose an SSH agent socket (`SSH_AUTH_SOCK`) to
+        /// the command; agent requests are relayed back over an agent channel.
+        forward_agent: bool,
     },
     /// Re-attach to a resumable session and replay output past `last_seq_seen`.
     Resume {
         resume_token: String,
         last_seq_seen: u64,
     },
+    /// Become the agent-forwarding channel of an existing session: the server
+    /// relays connections to the session's agent socket as Agent* messages.
+    AgentChannel { resume_token: String },
 }
 
 /// Messages flowing on an established exec channel (both directions).
@@ -68,6 +74,13 @@ pub enum ChannelMessage {
     /// Either direction: "I have seen everything up to `seq` from you", so
     /// the peer can drop those messages from its replay buffer.
     Ack { seq: u64 },
+    /// Agent channel, server -> client: a program on the server connected to
+    /// the forwarded agent socket; the client dials its local agent.
+    AgentOpen { id: u64 },
+    /// Agent channel, both directions: bytes of one agent connection.
+    AgentData { id: u64, data: Vec<u8> },
+    /// Agent channel, both directions: one side of the agent connection closed.
+    AgentClose { id: u64 },
 }
 
 pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, ProtocolError> {
@@ -104,13 +117,19 @@ mod tests {
         let req = ExecRequest::Exec {
             command: "/bin/sh -s".to_string(),
             resumable: false,
+            forward_agent: false,
         };
         let bytes = encode(&req).unwrap();
         let decoded: ExecRequest = decode(&bytes).unwrap();
         match decoded {
-            ExecRequest::Exec { command, resumable } => {
+            ExecRequest::Exec {
+                command,
+                resumable,
+                forward_agent,
+            } => {
                 assert_eq!(command, "/bin/sh -s");
                 assert!(!resumable);
+                assert!(!forward_agent);
             }
             other => panic!("unexpected request: {other:?}"),
         }

@@ -34,6 +34,7 @@ async fn login_and_exec_with_oidc() {
         token: None,
         issuer: Some(issuer.issuer_url()),
         client_id: Some("herdr-eternal".into()),
+        forward_agent: false,
     };
 
     oidc::login("testbox", &config).await.unwrap();

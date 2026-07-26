@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+mod agent;
 pub mod oidc;
 
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +62,9 @@ pub struct TargetConfig {
     pub issuer: Option<String>,
     /// OAuth client id used for the device-code flow.
     pub client_id: Option<String>,
+    /// Forward the local SSH agent (`SSH_AUTH_SOCK`) into the session.
+    #[serde(default)]
+    pub forward_agent: bool,
 }
 
 impl TargetConfig {
@@ -71,7 +75,12 @@ impl TargetConfig {
             Some(token) => token.clone(),
             None => oidc::access_token(name, self).await?,
         };
-        Ok(Target::new(self.url.clone(), token))
+        let mut target = Target::new(self.url.clone(), token);
+        if self.forward_agent {
+            // Without a local agent there is nothing to forward, like ssh -A.
+            target.agent_socket = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
+        }
+        Ok(target)
     }
 }
 
@@ -88,6 +97,8 @@ pub struct Target {
     /// Give up on a single connect/handshake attempt after this long, so a
     /// blackholed reconnect does not eat the whole resume window.
     pub connect_timeout: std::time::Duration,
+    /// Local SSH agent socket to forward into the session, if any.
+    pub agent_socket: Option<PathBuf>,
 }
 
 impl Target {
@@ -98,7 +109,17 @@ impl Target {
             keepalive_interval: std::time::Duration::from_secs(10),
             keepalive_timeout: std::time::Duration::from_secs(30),
             connect_timeout: std::time::Duration::from_secs(10),
+            agent_socket: None,
         }
+    }
+}
+
+/// Aborts a background task when the owning scope ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -159,6 +180,8 @@ pub async fn run_exec(
     let mut resume_token: Option<String> = None;
     // Set on disconnect; bounds how long we keep trying to resume afterwards.
     let mut resume_deadline: Option<tokio::time::Instant> = None;
+    // Runs the agent channel alongside the exec; aborted when we return.
+    let mut agent_channel: Option<AbortOnDrop> = None;
 
     loop {
         let connect = tokio::time::timeout(
@@ -169,6 +192,15 @@ pub async fn run_exec(
             Ok((ws, token)) => {
                 if resume_token.is_none() {
                     resume_token = token;
+                }
+                if agent_channel.is_none() {
+                    if let (Some(socket), Some(token)) = (&target.agent_socket, &resume_token) {
+                        agent_channel = Some(AbortOnDrop(tokio::spawn(agent::forward_agent(
+                            target.clone(),
+                            token.clone(),
+                            socket.clone(),
+                        ))));
+                    }
                 }
                 ws
             }
@@ -315,6 +347,7 @@ async fn connect_and_start(
         None => proto::ExecRequest::Exec {
             command: command.to_string(),
             resumable: true,
+            forward_agent: target.agent_socket.is_some(),
         },
     };
     send(&mut ws, &request).await?;

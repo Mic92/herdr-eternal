@@ -58,6 +58,9 @@ token = "..."
 # ... or OIDC (then run: herdr-eternal-ssh login mybox)
 issuer = "https://auth.example.com"
 client_id = "herdr-eternal"
+# Optional: expose the local SSH agent as SSH_AUTH_SOCK in the session
+# (same trust implications as `ssh -A`).
+forward_agent = true
 ```
 
 herdr config:

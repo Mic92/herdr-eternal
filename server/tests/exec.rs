@@ -62,6 +62,7 @@ async fn exec_relays_stdio_and_exit_code() {
         &proto::ExecRequest::Exec {
             command: "cat; echo err >&2; exit 3".into(),
             resumable: false,
+            forward_agent: false,
         },
     )
     .await;
@@ -147,6 +148,7 @@ async fn disconnected_session_expires_after_timeout() {
         &proto::ExecRequest::Exec {
             command: "sleep 60".into(),
             resumable: true,
+            forward_agent: false,
         },
     )
     .await;
