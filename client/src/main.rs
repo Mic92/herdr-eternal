@@ -94,7 +94,14 @@ fn run(name: &str, command: &str) -> Result<i32, ClientError> {
     let config = load_target(&default_config_path(), name)?;
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let target = config.resolve(name).await?;
+        let target = match config.resolve(name).await {
+            Ok(target) => target,
+            Err(ClientError::NotLoggedIn(_)) => {
+                oidc::login_on_tty(name, &config).await?;
+                config.resolve(name).await?
+            }
+            Err(err) => return Err(err),
+        };
         run_exec(
             &target,
             command,

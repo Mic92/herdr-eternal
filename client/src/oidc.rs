@@ -62,6 +62,24 @@ fn oidc_target(target: &TargetConfig) -> Result<OidcTarget<'_>, ClientError> {
 
 /// Runs the device-code flow and stores the resulting tokens for `name`.
 pub async fn login(name: &str, target: &TargetConfig) -> Result<(), ClientError> {
+    login_with_prompt(name, target, &mut std::io::stderr()).await
+}
+
+/// Like [`login`], but prompts on /dev/tty because stdio carries herdr's
+/// protocol during an exec.
+pub async fn login_on_tty(name: &str, target: &TargetConfig) -> Result<(), ClientError> {
+    let mut tty = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|_| ClientError::NotLoggedIn(name.to_string()))?;
+    login_with_prompt(name, target, &mut tty).await
+}
+
+async fn login_with_prompt(
+    name: &str,
+    target: &TargetConfig,
+    prompt: &mut dyn std::io::Write,
+) -> Result<(), ClientError> {
     let oidc = oidc_target(target)?;
     let discovery = discover(oidc.issuer).await?;
     let client = reqwest::Client::new();
@@ -78,11 +96,12 @@ pub async fn login(name: &str, target: &TargetConfig) -> Result<(), ClientError>
     .map_err(|error| ClientError::Oidc(format!("device authorization failed: {error}")))?;
 
     match &device.verification_uri_complete {
-        Some(url) => eprintln!("To authorize {name}, open: {url}"),
-        None => eprintln!(
+        Some(url) => writeln!(prompt, "To authorize {name}, open: {url}")?,
+        None => writeln!(
+            prompt,
             "To authorize {name}, open {} and enter code {}",
             device.verification_uri, device.user_code
-        ),
+        )?,
     }
 
     let interval = std::time::Duration::from_secs(device.interval.unwrap_or(5));
@@ -111,7 +130,7 @@ pub async fn login(name: &str, target: &TargetConfig) -> Result<(), ClientError>
     };
 
     store_tokens(name, &tokens)?;
-    eprintln!("Logged in to {name}.");
+    writeln!(prompt, "Logged in to {name}.")?;
     Ok(())
 }
 
