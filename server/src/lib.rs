@@ -241,6 +241,14 @@ impl Server {
     /// directory) there is nowhere to put them and the sessions die with this
     /// process.
     async fn shut_down(&self) -> Result<(), ServerError> {
+        // The successor cannot reset unknown QUIC connections, so tell
+        // clients now instead of letting them hit their idle timeout.
+        if let Some(endpoint) = &self.quic {
+            endpoint.close(0u32.into(), b"server restarting");
+            tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle())
+                .await
+                .ok();
+        }
         let Some(dir) = std::env::var_os("RUNTIME_DIRECTORY") else {
             return Ok(());
         };
