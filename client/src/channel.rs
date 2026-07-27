@@ -58,6 +58,15 @@ impl Conn {
         let (ws, _) = tokio_tungstenite::connect_async(&target.url)
             .await
             .map_err(Box::new)?;
+        // Keystroke-sized frames must not sit in Nagle's buffer.
+        let stream = match ws.get_ref() {
+            MaybeTlsStream::Plain(stream) => Some(stream),
+            MaybeTlsStream::Rustls(tls) => Some(tls.get_ref().0),
+            _ => None,
+        };
+        if let Some(stream) = stream {
+            stream.set_nodelay(true).ok();
+        }
         Ok(Conn::Ws(Box::new(ws)))
     }
 

@@ -184,6 +184,8 @@ impl Server {
                 _ = sigterm.recv() => return self.shut_down().await,
             };
             let (stream, peer) = accepted?;
+            // Keystroke-sized frames must not sit in Nagle's buffer.
+            stream.set_nodelay(true).ok();
             let server = Arc::clone(&self);
             tokio::spawn(async move {
                 let channel = match tokio_tungstenite::accept_async(stream).await {
