@@ -6,17 +6,15 @@ down with them. herdr-eternal replaces ssh as herdr's transport with a
 WebSocket channel that reconnects and resumes byte-exactly, so a netsplit is
 invisible to herdr.
 
-## Components
+## Architecture
 
-- `herdr-eternal-server` — daemon on the remote machine. Accepts
-  authenticated WebSocket connections (put nginx/TLS in front) and runs exec
-  channels through the user's shell. Sessions survive dropped connections.
-- `herdr-eternal-ssh` — drop-in for the ssh invocation herdr makes. herdr
-  points at it via the `remote.ssh_command` config option
-  (`nix/patches/0001-remote-make-ssh-transport-program-configurable.patch`
-  until it is upstream).
-- `herdr-eternal-proto` — shared wire protocol (postcard-framed messages,
-  sequence-numbered stdio, resume tokens).
+![Architecture](docs/architecture.svg)
+
+`herdr-eternal-ssh` is a drop-in for the ssh invocation herdr makes
+(`remote.ssh_command`,
+`nix/patches/0001-remote-make-ssh-transport-program-configurable.patch` until
+it is upstream). Both ends speak `herdr-eternal-proto`, a postcard-framed
+protocol with sequence-numbered stdio and resume tokens.
 
 ## Server deployment (NixOS)
 
