@@ -13,8 +13,7 @@ invisible to herdr.
 `herdr-eternal-ssh` is a drop-in for the ssh invocation herdr makes
 (`remote.ssh_command`,
 `nix/patches/0001-remote-make-ssh-transport-program-configurable.patch` until
-it is upstream). Both ends speak `herdr-eternal-proto`, a postcard-framed
-protocol with sequence-numbered stdio and resume tokens.
+it is upstream).
 
 ## Server deployment (NixOS)
 
