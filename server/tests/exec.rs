@@ -162,7 +162,7 @@ async fn disconnected_session_expires_after_timeout() {
 
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
-    // The expired session cannot be resumed; the server closes the connection.
+    // The expired session cannot be resumed; the server denies the request.
     let mut ws = connect().await;
     send(
         &mut ws,
@@ -172,12 +172,7 @@ async fn disconnected_session_expires_after_timeout() {
         },
     )
     .await;
-    loop {
-        match ws.next().await {
-            Some(Ok(Message::Close(_))) | None => break,
-            Some(Ok(Message::Binary(_))) => panic!("server resumed an expired session"),
-            Some(Ok(_)) => continue,
-            Some(Err(_)) => break,
-        }
-    }
+    let proto::ChannelMessage::Denied { .. } = recv(&mut ws).await else {
+        panic!("server resumed an expired session");
+    };
 }

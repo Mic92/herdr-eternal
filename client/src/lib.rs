@@ -36,6 +36,8 @@ pub enum ClientError {
     Protocol(#[from] proto::ProtocolError),
     #[error("server closed the connection unexpectedly")]
     ConnectionClosed,
+    #[error("server rejected the session: {0}")]
+    Denied(String),
     #[error("timed out connecting to the server")]
     ConnectTimeout,
     #[error("cannot fetch {url}: {source}")]
@@ -168,9 +170,10 @@ pub fn default_config_path() -> PathBuf {
     base.join("herdr-eternal").join("config.toml")
 }
 
-/// How long a disconnected exec keeps trying to resume before giving up.
-const RESUME_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Reconnect backoff after a disconnect. The server alone decides how long a
+/// session stays resumable, so the client retries until it gets an answer.
 const RESUME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+const RESUME_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Runs `command` on the target and relays stdio; returns the remote exit code.
 ///
@@ -192,8 +195,7 @@ pub async fn run_exec(
     let mut client_seq: u64 = 0;
     let mut last_server_seq: u64 = 0;
     let mut resume_token: Option<String> = None;
-    // Set on disconnect; bounds how long we keep trying to resume afterwards.
-    let mut resume_deadline: Option<tokio::time::Instant> = None;
+    let mut retry_delay = RESUME_RETRY_DELAY;
     // Runs the agent channel alongside the exec; aborted when we return.
     let mut agent_channel: Option<AbortOnDrop> = None;
 
@@ -218,17 +220,14 @@ pub async fn run_exec(
                 }
                 conn
             }
-            Err(err) => {
-                // resume_deadline is only set after a resumable session dropped.
-                match resume_deadline {
-                    Some(deadline) if tokio::time::Instant::now() < deadline => {
-                        tokio::time::sleep(RESUME_RETRY_DELAY).await;
-                        continue;
-                    }
-                    _ => return Err(err),
-                }
+            Err(err) if resume_token.is_some() && !matches!(err, ClientError::Denied(_)) => {
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(RESUME_RETRY_MAX);
+                continue;
             }
+            Err(err) => return Err(err),
         };
+        retry_delay = RESUME_RETRY_DELAY;
 
         let attached = async {
             // Resend stdin the server may not have seen; it deduplicates by seq.
@@ -312,7 +311,6 @@ pub async fn run_exec(
             Ok(Some(code)) => return Ok(code),
             // Disconnected mid-exec: resume if the server handed out a token.
             Ok(None) if resume_token.is_some() => {
-                resume_deadline = Some(tokio::time::Instant::now() + RESUME_WINDOW);
                 tokio::time::sleep(RESUME_RETRY_DELAY).await;
             }
             Ok(None) => return Err(ClientError::ConnectionClosed),
@@ -357,10 +355,11 @@ async fn connect_and_start(
     };
     conn.send(&request).await?;
 
-    let proto::ChannelMessage::Started { resume_token } = conn.recv().await? else {
-        return Err(ClientError::ConnectionClosed);
-    };
-    Ok((conn, resume_token))
+    match conn.recv().await? {
+        proto::ChannelMessage::Started { resume_token } => Ok((conn, resume_token)),
+        proto::ChannelMessage::Denied { reason } => Err(ClientError::Denied(reason)),
+        _ => Err(ClientError::ConnectionClosed),
+    }
 }
 
 #[cfg(test)]

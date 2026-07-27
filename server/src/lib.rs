@@ -622,7 +622,7 @@ async fn handle_connection(
         } => {
             debug!(%resume_token, last_seq_seen, "resume");
             let Some(session) = sessions.get(&resume_token) else {
-                channel.close().await;
+                deny(&mut channel, "unknown resume token").await;
                 return Err(ServerError::UnknownResumeToken);
             };
             (resume_token, session, last_seq_seen)
@@ -630,11 +630,11 @@ async fn handle_connection(
         proto::ExecRequest::AgentChannel { resume_token } => {
             debug!(%resume_token, "agent channel");
             let Some(session) = sessions.get(&resume_token) else {
-                channel.close().await;
+                deny(&mut channel, "unknown resume token").await;
                 return Err(ServerError::UnknownResumeToken);
             };
             let Some(hub) = session.agent.clone() else {
-                channel.close().await;
+                deny(&mut channel, "agent forwarding not enabled").await;
                 return Err(ServerError::AgentNotEnabled);
             };
             // Keep the session attached while its agent channel is, so it is
@@ -937,6 +937,17 @@ async fn session_task(
 
 /// Streams the session's outbound log to this connection (starting after
 /// `sent_up_to`) and forwards its inbound messages to the session.
+/// Rejects a request explicitly so the client stops retrying.
+async fn deny(channel: &mut Channel, reason: &str) {
+    channel
+        .send(&proto::ChannelMessage::Denied {
+            reason: reason.to_string(),
+        })
+        .await
+        .ok();
+    channel.close().await;
+}
+
 async fn attach(
     mut channel: Channel,
     sessions: &SessionRegistry,

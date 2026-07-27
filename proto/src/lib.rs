@@ -61,6 +61,8 @@ pub enum ExecRequest {
 pub enum ChannelMessage {
     /// Server -> client: session accepted; token present when resumable.
     Started { resume_token: Option<String> },
+    /// Server -> client: request rejected (e.g. unknown resume token); do not retry.
+    Denied { reason: String },
     /// Client -> server.
     Stdin { seq: u64, data: Vec<u8> },
     /// Client -> server: no more stdin.
