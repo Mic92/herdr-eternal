@@ -1,9 +1,10 @@
 # herdr-eternal
 
 Roaming-friendly transport for `herdr --remote`. OpenSSH connections die on
-network changes, suspend, or flaky Wi-Fi and take the herdr remote session
-down with them. herdr-eternal replaces ssh as herdr's transport with a
-WebSocket channel that reconnects and resumes byte-exactly, so a netsplit is
+network changes, suspend, or flaky Wi-Fi. That takes the herdr remote session
+down with them. herdr-eternal replaces ssh as herdr's transport. It connects
+over QUIC, falling back to a WebSocket behind nginx when UDP is blocked.
+Dropped connections reconnect and resume byte-exactly. A netsplit is
 invisible to herdr.
 
 ## Architecture
