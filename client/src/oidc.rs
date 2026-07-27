@@ -62,7 +62,7 @@ fn oidc_target(target: &TargetConfig) -> Result<OidcTarget<'_>, ClientError> {
 
 /// Runs the device-code flow and stores the resulting tokens for `name`.
 pub async fn login(name: &str, target: &TargetConfig) -> Result<(), ClientError> {
-    login_with_prompt(name, target, &mut std::io::stderr()).await
+    login_with_prompt(name, target, &mut std::io::stderr(), false).await
 }
 
 /// Like [`login`], but prompts on /dev/tty because stdio carries herdr's
@@ -72,13 +72,16 @@ pub async fn login_on_tty(name: &str, target: &TargetConfig) -> Result<(), Clien
         .write(true)
         .open("/dev/tty")
         .map_err(|_| ClientError::NotLoggedIn(name.to_string()))?;
-    login_with_prompt(name, target, &mut tty).await
+    // A TUI (herdr) usually owns the terminal, so the /dev/tty prompt may
+    // never be seen; opening the browser is the only reliable signal.
+    login_with_prompt(name, target, &mut tty, true).await
 }
 
 async fn login_with_prompt(
     name: &str,
     target: &TargetConfig,
-    prompt: &mut dyn std::io::Write,
+    prompt: &mut (dyn std::io::Write + Send),
+    open_browser: bool,
 ) -> Result<(), ClientError> {
     let oidc = oidc_target(target)?;
     let discovery = discover(oidc.issuer).await?;
@@ -102,6 +105,13 @@ async fn login_with_prompt(
             "To authorize {name}, open {} and enter code {}",
             device.verification_uri, device.user_code
         )?,
+    }
+    if open_browser {
+        let url = device
+            .verification_uri_complete
+            .as_deref()
+            .unwrap_or(&device.verification_uri);
+        open_in_browser(url);
     }
 
     let interval = std::time::Duration::from_secs(device.interval.unwrap_or(5));
@@ -147,7 +157,7 @@ pub async fn access_token(name: &str, target: &TargetConfig) -> Result<String, C
     };
     let discovery = discover(oidc.issuer).await?;
     let client = reqwest::Client::new();
-    let tokens: TokenResponse = token_request(
+    let mut tokens: TokenResponse = token_request(
         &client,
         &discovery.token_endpoint,
         &[
@@ -158,9 +168,31 @@ pub async fn access_token(name: &str, target: &TargetConfig) -> Result<String, C
     )
     .await?
     .map_err(|_| ClientError::NotLoggedIn(name.to_string()))?;
+    // Providers that do not rotate refresh tokens omit the field in the
+    // refresh response; dropping ours would silently log the target out as
+    // soon as the new access token expires.
+    if tokens.refresh_token.is_none() {
+        tokens.refresh_token = Some(refresh_token);
+    }
     let access_token = tokens.access_token.clone();
     store_tokens(name, &tokens)?;
     Ok(access_token)
+}
+
+/// Best-effort: hands the verification URL to the desktop browser. Failures
+/// are ignored because the URL is also printed to the prompt.
+fn open_in_browser(url: &str) {
+    for opener in ["xdg-open", "open"] {
+        let spawned = std::process::Command::new(opener)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if spawned.is_ok() {
+            return;
+        }
+    }
 }
 
 async fn discover(issuer: &str) -> Result<Discovery, ClientError> {

@@ -31,9 +31,10 @@ pub(crate) async fn forward_agent(target: Target, resume_token: String, agent_so
 }
 
 async fn connect_agent_channel(target: &Target, resume_token: &str) -> Result<Conn, ClientError> {
+    let token = target.access_token().await?;
     let mut conn = Conn::connect(target).await?;
     conn.send(&proto::Hello {
-        token: target.token.clone(),
+        token,
         client_name: "herdr-eternal-ssh (agent)".to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
     })

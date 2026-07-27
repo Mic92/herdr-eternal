@@ -44,7 +44,11 @@ fn parse_ssh_args<I: IntoIterator<Item = String>>(args: I) -> Option<SshArgs> {
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                // quinn_udp warns on transient sendmsg failures (e.g. network
+                // unreachable while roaming); the reconnect/resume logic already
+                // handles those, so don't leak them into the terminal.
+                .unwrap_or_else(|_| "warn,quinn_udp=error".into()),
         )
         .with_writer(std::io::stderr)
         .init();

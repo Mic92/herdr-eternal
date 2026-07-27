@@ -216,13 +216,17 @@ async fn token_grant(
     };
 
     // Mirror Authelia's device-code grant: sub and client_id claims, no aud.
-    axum::Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "access_token": inner.token(Some(&sub), Some(&client_id), None, 3600),
         "token_type": "Bearer",
         "expires_in": 3600,
-        "refresh_token": REFRESH_TOKEN,
-    }))
-    .into_response()
+    });
+    // Like providers without refresh-token rotation, the refresh grant does
+    // not hand out a new refresh token; clients must keep the old one.
+    if grant_type != Some("refresh_token") {
+        body["refresh_token"] = REFRESH_TOKEN.into();
+    }
+    axum::Json(body).into_response()
 }
 
 fn oauth_error(error: &str) -> axum::response::Response {

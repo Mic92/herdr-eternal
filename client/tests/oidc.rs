@@ -76,6 +76,36 @@ async fn login_and_exec_with_oidc() {
     assert_eq!(String::from_utf8(stdout).unwrap(), "refreshed\n");
     assert_eq!(code, 0);
 
+    // Regression: the access token must be re-resolved on every connect, not
+    // frozen at resolve() time. Simulate an access token that expired after
+    // resolve(): the cache holds an already-expired JWT, marked as valid so
+    // resolve() does not refresh it, then flip expires_at so the connect path
+    // has to refresh via the refresh token to succeed.
+    cached["access_token"] = issuer.token("joerg", "herdr-eternal", -300).into();
+    cached["expires_at"] = (u64::MAX).into();
+    cached["refresh_token"] = "test-refresh-token".into();
+    std::fs::write(&cache, serde_json::to_vec(&cached).unwrap()).unwrap();
+    let stale = config.resolve("testbox").await.unwrap();
+    cached["expires_at"] = 0.into();
+    std::fs::write(&cache, serde_json::to_vec(&cached).unwrap()).unwrap();
+    let mut stdout = Vec::new();
+    let code = run_exec(
+        &stale,
+        "echo reconnected",
+        &b""[..],
+        &mut stdout,
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(String::from_utf8(stdout).unwrap(), "reconnected\n");
+    assert_eq!(code, 0);
+
+    // The refresh response carried no new refresh token (no rotation); the
+    // old one must survive so the next expiry does not log the target out.
+    let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    assert_eq!(after["refresh_token"], "test-refresh-token");
+
     // A target that never logged in gets a helpful error instead of a
     // rejected connection.
     let err = config.resolve("otherbox").await.unwrap_err();

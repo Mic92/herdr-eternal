@@ -76,14 +76,22 @@ pub struct TargetConfig {
 }
 
 impl TargetConfig {
-    /// Resolves the token to present: the static token if configured,
-    /// otherwise a cached/refreshed OIDC access token.
+    /// Resolves how the token is obtained: the static token if configured,
+    /// otherwise the OIDC token cache.
     pub async fn resolve(&self, name: &str) -> Result<Target, ClientError> {
         let token = match &self.token {
-            Some(token) => token.clone(),
-            None => oidc::access_token(name, self).await?,
+            Some(token) => TokenSource::Static(token.clone()),
+            None => {
+                // Fail early (so the caller can run the login flow) instead of
+                // erroring on the first connect.
+                oidc::access_token(name, self).await?;
+                TokenSource::Oidc {
+                    name: name.to_string(),
+                    config: Box::new(self.clone()),
+                }
+            }
         };
-        let mut target = Target::new(self.url.clone(), token);
+        let mut target = Target::with_token_source(self.url.clone(), token);
         target.quic_addr = self.quic_addr.clone();
         target.quic_ca = self.quic_ca.clone();
         if self.forward_agent {
@@ -94,11 +102,23 @@ impl TargetConfig {
     }
 }
 
-/// Connection parameters with a resolved authentication token.
+/// Where the `Hello` token comes from. OIDC tokens are re-resolved on every
+/// connect attempt so long sessions can reconnect after the initial access
+/// token expired.
+#[derive(Debug, Clone)]
+enum TokenSource {
+    Static(String),
+    Oidc {
+        name: String,
+        config: Box<TargetConfig>,
+    },
+}
+
+/// Connection parameters with a resolved authentication token source.
 #[derive(Debug, Clone)]
 pub struct Target {
     pub url: String,
-    pub token: String,
+    token: TokenSource,
     /// How often to send a WebSocket ping while attached.
     pub keepalive_interval: std::time::Duration,
     /// Treat the connection as dead when nothing (not even a pong) arrived
@@ -117,6 +137,10 @@ pub struct Target {
 
 impl Target {
     pub fn new(url: String, token: String) -> Self {
+        Self::with_token_source(url, TokenSource::Static(token))
+    }
+
+    fn with_token_source(url: String, token: TokenSource) -> Self {
         Self {
             url,
             token,
@@ -126,6 +150,15 @@ impl Target {
             agent_socket: None,
             quic_addr: None,
             quic_ca: None,
+        }
+    }
+
+    /// Returns a token that is valid right now; OIDC access tokens are
+    /// refreshed from the cache/refresh token on every call.
+    pub(crate) async fn access_token(&self) -> Result<String, ClientError> {
+        match &self.token {
+            TokenSource::Static(token) => Ok(token.clone()),
+            TokenSource::Oidc { name, config } => oidc::access_token(name, config).await,
         }
     }
 }
@@ -219,6 +252,18 @@ pub async fn run_exec(
                     }
                 }
                 conn
+            }
+            // Refresh token expired mid-session: re-run the device-code login.
+            Err(ClientError::NotLoggedIn(name)) => {
+                let TokenSource::Oidc {
+                    name: target_name,
+                    config,
+                } = &target.token
+                else {
+                    return Err(ClientError::NotLoggedIn(name));
+                };
+                oidc::login_on_tty(target_name, config).await?;
+                continue;
             }
             Err(err) if resume_token.is_some() && !matches!(err, ClientError::Denied(_)) => {
                 tokio::time::sleep(retry_delay).await;
@@ -332,10 +377,11 @@ async fn connect_and_start(
     resume_token: &Option<String>,
     last_server_seq: u64,
 ) -> Result<(Conn, Option<String>), ClientError> {
+    let token = target.access_token().await?;
     let mut conn = Conn::connect(target).await?;
 
     conn.send(&proto::Hello {
-        token: target.token.clone(),
+        token,
         client_name: "herdr-eternal-ssh".to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
     })
