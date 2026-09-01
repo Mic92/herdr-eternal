@@ -8,6 +8,9 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/Mic92/herdr-eternal-server"
 
+[workspace.metadata.crane]
+name = "herdr-eternal"
+
 [workspace.dependencies]
 herdr-eternal-proto = { path = "proto" }
 thiserror = "2"
