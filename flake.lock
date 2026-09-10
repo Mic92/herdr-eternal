@@ -15,53 +15,33 @@
         "type": "github"
       }
     },
-    "flake-parts": {
-      "inputs": {
-        "nixpkgs-lib": [
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1782949081,
-        "narHash": "sha256-vp6Y/Grm98ESt6ceOkWiHWyZRDV3J1RID4w+6NWK9yA=",
-        "owner": "hercules-ci",
-        "repo": "flake-parts",
-        "rev": "17c9d6cdfc60c64f4ee8d306f9bc0b4ccb51481e",
-        "type": "github"
-      },
-      "original": {
-        "owner": "hercules-ci",
-        "repo": "flake-parts",
-        "type": "github"
-      }
-    },
     "herdr": {
       "inputs": {
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1784767664,
-        "narHash": "sha256-m5jEDImymgu84HXgeeLjOz6KhWP5+is8RNA5Ww+z5BI=",
+        "lastModified": 1788798791,
+        "narHash": "sha256-c2mzI+/5Mr5dy29T5SI298uOjwTbDatnHSdGNAisiws=",
         "owner": "ogulcancelik",
         "repo": "herdr",
-        "rev": "e7fc85bfdb51f89488430adbfe5bbced3be79c2f",
+        "rev": "702aa1e45527509bec73dad9b8d443f449c0379b",
         "type": "github"
       },
       "original": {
         "owner": "ogulcancelik",
         "repo": "herdr",
-        "rev": "e7fc85bfdb51f89488430adbfe5bbced3be79c2f",
+        "rev": "702aa1e45527509bec73dad9b8d443f449c0379b",
         "type": "github"
       }
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1779357205,
-        "narHash": "sha256-cCO8aTqss5x9Ky8GWkpY0Hy5fyTZEbtifSUV8QjSzic=",
+        "lastModified": 1779911860,
+        "narHash": "sha256-ubcLAcKBDCZjhxw/kH5DL5GdBZQdzLqpkTe7HonvJVs=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "f83fc3c307e74bc5fd5adb7eb6b8b13ffd2a36e1",
+        "rev": "c0a89c379b4ac67c7b13b051ddbd4e0dbc9b0eaf",
         "type": "github"
       },
       "original": {
@@ -90,7 +70,6 @@
     "root": {
       "inputs": {
         "crane": "crane",
-        "flake-parts": "flake-parts",
         "herdr": "herdr",
         "nixpkgs": "nixpkgs_2",
         "treefmt-nix": "treefmt-nix"

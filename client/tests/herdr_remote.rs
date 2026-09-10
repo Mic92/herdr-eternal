@@ -102,16 +102,29 @@ async fn herdr_remote_bootstraps_over_the_transport() {
         ),
     );
 
-    // The bootstrap (platform detection, binary discovery, server start,
-    // stdio bridge) all runs before the TUI needs a terminal, so a piped
-    // stdout/stderr is fine for what this test asserts.
+    // The remote herdr server is started lazily by the first client
+    // connection through the bridge, and the client refuses to connect
+    // without a sized terminal. Give it a pty; stderr stays piped so
+    // bootstrap errors end up in the assertion message.
+    let pty = nix::pty::openpty(
+        Some(&nix::pty::Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }),
+        None,
+    )
+    .unwrap();
+    let slave = pty.slave;
     let mut herdr = Command::new("herdr")
         .args(["--remote", "testbox"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave))
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let _master = pty.master;
 
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut started = false;
@@ -129,8 +142,7 @@ async fn herdr_remote_bootstraps_over_the_transport() {
 
     assert!(
         started,
-        "herdr --remote did not start the remote server over the transport.\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
+        "herdr --remote did not start the remote server over the transport.\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr),
     );
 }

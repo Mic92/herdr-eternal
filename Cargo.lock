@@ -512,6 +512,7 @@ dependencies = [
  "futures-util",
  "herdr-eternal-proto",
  "herdr-eternal-server",
+ "nix",
  "quinn",
  "rcgen",
  "reqwest",

@@ -25,5 +25,6 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 herdr-eternal-server = { path = "../server", features = ["test-util"] }
+nix = { workspace = true, features = ["term"] }
 rcgen = { workspace = true }
 tempfile = { workspace = true }
