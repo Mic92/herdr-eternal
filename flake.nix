@@ -3,93 +3,129 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-parts.url = "github:hercules-ci/flake-parts";
-    flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     crane.url = "github:ipetkov/crane";
     # Pinned to the commit the remote.ssh_command patch applies to.
-    herdr.url = "github:ogulcancelik/herdr/e7fc85bfdb51f89488430adbfe5bbced3be79c2f";
+    herdr.url = "github:ogulcancelik/herdr/702aa1e45527509bec73dad9b8d443f449c0379b";
   };
 
   outputs =
-    inputs@{ flake-parts, ... }:
-    flake-parts.lib.mkFlake { inherit inputs; } {
+    {
+      self,
+      nixpkgs,
+      treefmt-nix,
+      crane,
+      herdr,
+    }:
+    let
       systems = [
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
       ];
-      imports = [ inputs.treefmt-nix.flakeModule ];
+      inherit (nixpkgs) lib;
+      forAllSystems = f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
-      flake.nixosModules.default =
-        { pkgs, lib, ... }:
-        {
-          imports = [ ./nix/module.nix ];
-          services.herdr-eternal-server.package =
-            lib.mkDefault
-              inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-        };
+      treefmtEval = forAllSystems (
+        pkgs:
+        treefmt-nix.lib.evalModule pkgs {
+          projectRootFile = "flake.nix";
+          programs.nixfmt.enable = true;
+          programs.rustfmt.enable = true;
+        }
+      );
 
-      perSystem =
-        { pkgs, ... }:
+      perSystem = forAllSystems (
+        pkgs:
         let
-          craneLib = inputs.crane.mkLib pkgs;
+          craneLib = crane.mkLib pkgs;
           # herdr with the remote.ssh_command option, used by the herdr-driven
           # integration test in client/tests/.
-          herdrPatched = inputs.herdr.packages.${pkgs.stdenv.hostPlatform.system}.herdr.overrideAttrs (old: {
+          herdrPatched = herdr.packages.${pkgs.stdenv.hostPlatform.system}.herdr.overrideAttrs (old: {
             patches = (old.patches or [ ]) ++ [
               ./nix/patches/0001-remote-make-ssh-transport-program-configurable.patch
             ];
           });
-          src = craneLib.cleanCargoSource ./.;
           commonArgs = {
-            inherit src;
+            src = craneLib.cleanCargoSource ./.;
             strictDeps = true;
+            # Virtual workspace: no [package] in the root Cargo.toml.
+            pname = "herdr-eternal";
+            version = "0.1.0";
           };
           # Build dependencies once and reuse them for the workspace, clippy and tests.
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           workspace = craneLib.buildPackage (commonArgs // { inherit cargoArtifacts; });
         in
         {
-          packages = {
-            default = workspace;
-            herdr-eternal = workspace;
-          };
+          inherit
+            craneLib
+            herdrPatched
+            commonArgs
+            cargoArtifacts
+            workspace
+            ;
+        }
+      );
+    in
+    {
+      nixosModules.default =
+        { pkgs, lib, ... }:
+        {
+          imports = [ ./nix/module.nix ];
+          services.herdr-eternal-server.package =
+            lib.mkDefault
+              self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
 
-          checks = {
-            inherit workspace;
-            clippy = craneLib.cargoClippy (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--all-targets -- -D warnings";
-              }
-            );
-            tests = craneLib.cargoTest (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-                # The herdr-driven end-to-end test needs herdr in PATH.
-                nativeCheckInputs = [ herdrPatched ];
-              }
-            );
-          }
-          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-            # Full deployment path: NixOS module, nginx WebSocket proxying,
-            # client exec through the proxy.
-            nixos = pkgs.callPackage ./nix/nixos-test.nix {
-              nixosModule = inputs.self.nixosModules.default;
-              package = workspace;
-            };
-            # Compatibility with a real OIDC provider.
-            nixos-authelia = pkgs.callPackage ./nix/nixos-test-authelia.nix {
-              nixosModule = inputs.self.nixosModules.default;
-              package = workspace;
-            };
-          };
+      packages = forAllSystems (
+        pkgs: with perSystem.${pkgs.stdenv.hostPlatform.system}; {
+          default = workspace;
+          herdr-eternal = workspace;
+        }
+      );
 
-          devShells.default = craneLib.devShell {
+      checks = forAllSystems (
+        pkgs:
+        with perSystem.${pkgs.stdenv.hostPlatform.system};
+        {
+          inherit workspace;
+          formatting = treefmtEval.${pkgs.stdenv.hostPlatform.system}.config.build.check self;
+          clippy = craneLib.cargoClippy (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              cargoClippyExtraArgs = "--all-targets -- -D warnings";
+            }
+          );
+          tests = craneLib.cargoTest (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              # The herdr-driven end-to-end test needs herdr in PATH.
+              nativeCheckInputs = [ herdrPatched ];
+            }
+          );
+        }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # Full deployment path: NixOS module, nginx WebSocket proxying,
+          # client exec through the proxy.
+          nixos = pkgs.callPackage ./nix/nixos-test.nix {
+            nixosModule = self.nixosModules.default;
+            package = workspace;
+          };
+          # Compatibility with a real OIDC provider.
+          nixos-authelia = pkgs.callPackage ./nix/nixos-test-authelia.nix {
+            nixosModule = self.nixosModules.default;
+            package = workspace;
+          };
+        }
+      );
+
+      devShells = forAllSystems (
+        pkgs: with perSystem.${pkgs.stdenv.hostPlatform.system}; {
+          default = craneLib.devShell {
             packages = [
               pkgs.clippy
               pkgs.rustfmt
@@ -97,12 +133,11 @@
               herdrPatched
             ];
           };
+        }
+      );
 
-          treefmt = {
-            projectRootFile = "flake.nix";
-            programs.nixfmt.enable = true;
-            programs.rustfmt.enable = true;
-          };
-        };
+      formatter = forAllSystems (
+        pkgs: treefmtEval.${pkgs.stdenv.hostPlatform.system}.config.build.wrapper
+      );
     };
 }
