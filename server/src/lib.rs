@@ -212,7 +212,11 @@ impl Server {
                 let channel = async {
                     let connection = incoming.await?;
                     let (send, recv) = connection.accept_bi().await?;
-                    Ok::<_, quinn::ConnectionError>(Channel::Quic { send, recv })
+                    Ok::<_, quinn::ConnectionError>(Channel::Quic {
+                        send,
+                        recv,
+                        decoder: proto::FrameDecoder::new(),
+                    })
                 };
                 match channel.await {
                     Ok(channel) => {
