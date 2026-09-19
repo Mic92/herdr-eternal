@@ -10,14 +10,13 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::ServerError;
 
-/// Upper bound for a single QUIC frame; stdio chunks are 16 KiB.
-const MAX_FRAME: u32 = 1024 * 1024;
-
 pub(crate) enum Channel {
     Ws(Box<WebSocketStream<TcpStream>>),
     Quic {
         send: quinn::SendStream,
         recv: quinn::RecvStream,
+        /// Holds partially received frames across cancelled `next()` calls.
+        decoder: proto::FrameDecoder,
     },
 }
 
@@ -31,14 +30,13 @@ pub(crate) enum Event {
 
 impl Channel {
     pub(crate) async fn send<T: serde::Serialize>(&mut self, msg: &T) -> Result<(), ServerError> {
-        let bytes = proto::encode(msg)?;
         match self {
-            Channel::Ws(ws) => ws.send(Message::Binary(bytes)).await.map_err(Box::new)?,
+            Channel::Ws(ws) => ws
+                .send(Message::Binary(proto::encode(msg)?))
+                .await
+                .map_err(Box::new)?,
             Channel::Quic { send, .. } => {
-                send.write_all(&(bytes.len() as u32).to_be_bytes())
-                    .await
-                    .map_err(std::io::Error::other)?;
-                send.write_all(&bytes)
+                send.write_all(&proto::encode_frame(msg)?)
                     .await
                     .map_err(std::io::Error::other)?;
             }
@@ -58,6 +56,8 @@ impl Channel {
 
     /// Waits for the next protocol frame, skipping transport-internal
     /// messages (WebSocket ping/pong/text).
+    ///
+    /// Cancel-safe: the attach loops poll this inside `tokio::select!`.
     pub(crate) async fn next(&mut self) -> Event {
         match self {
             Channel::Ws(ws) => loop {
@@ -68,26 +68,18 @@ impl Channel {
                     Some(Err(err)) => return Event::Failed(Box::new(err).into()),
                 }
             },
-            Channel::Quic { recv, .. } => {
-                let mut len = [0_u8; 4];
-                match recv.read_exact(&mut len).await {
-                    Ok(()) => {}
-                    Err(quinn::ReadExactError::FinishedEarly(_)) => return Event::Closed,
+            Channel::Quic { recv, decoder, .. } => loop {
+                match decoder.next_frame() {
+                    Ok(Some(frame)) => return Event::Frame(frame),
+                    Ok(None) => {}
                     Err(err) => return Event::Failed(std::io::Error::other(err).into()),
                 }
-                let len = u32::from_be_bytes(len);
-                if len > MAX_FRAME {
-                    return Event::Failed(
-                        std::io::Error::other(format!("oversized frame: {len} bytes")).into(),
-                    );
+                match recv.read_chunk(64 * 1024, true).await {
+                    Ok(Some(chunk)) => decoder.push(&chunk.bytes),
+                    Ok(None) => return Event::Closed,
+                    Err(err) => return Event::Failed(std::io::Error::other(err).into()),
                 }
-                let mut bytes = vec![0; len as usize];
-                match recv.read_exact(&mut bytes).await {
-                    Ok(()) => Event::Frame(bytes),
-                    Err(quinn::ReadExactError::FinishedEarly(_)) => Event::Closed,
-                    Err(err) => Event::Failed(std::io::Error::other(err).into()),
-                }
-            }
+            },
         }
     }
 

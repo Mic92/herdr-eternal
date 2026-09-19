@@ -93,6 +93,59 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, ProtocolErro
     postcard::from_bytes(bytes).map_err(ProtocolError::Decode)
 }
 
+/// Upper bound for a single stream frame; stdio chunks are 16 KiB.
+pub const MAX_FRAME: usize = 1024 * 1024;
+
+/// Length-prefixes `msg` for a byte-stream transport (QUIC).
+pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, ProtocolError> {
+    let body = encode(msg)?;
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("oversized frame: {0} bytes")]
+pub struct OversizedFrame(pub usize);
+
+/// Reassembles length-prefixed frames from a byte stream.
+///
+/// All partial state lives in the decoder, so a reader built on it stays
+/// cancel-safe inside `tokio::select!`: dropping a pending read never loses
+/// bytes that were already taken off the stream.
+#[derive(Debug, Default)]
+pub struct FrameDecoder {
+    buf: Vec<u8>,
+}
+
+impl FrameDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Pops the next complete frame, if buffered.
+    pub fn next_frame(&mut self) -> Result<Option<Vec<u8>>, OversizedFrame> {
+        let Some(len) = self.buf.first_chunk::<4>() else {
+            return Ok(None);
+        };
+        let len = u32::from_be_bytes(*len) as usize;
+        if len > MAX_FRAME {
+            return Err(OversizedFrame(len));
+        }
+        if self.buf.len() < 4 + len {
+            return Ok(None);
+        }
+        let rest = self.buf.split_off(4 + len);
+        let frame = std::mem::replace(&mut self.buf, rest).split_off(4);
+        Ok(Some(frame))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +165,37 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn frame_decoder_reassembles_split_and_coalesced_frames() {
+        let a = encode_frame(&ChannelMessage::Ack { seq: 1 }).unwrap();
+        let b = encode_frame(&ChannelMessage::Stdout {
+            seq: 2,
+            data: vec![7; 30_000],
+        })
+        .unwrap();
+        let mut wire = a.clone();
+        wire.extend_from_slice(&b);
+
+        let mut decoder = FrameDecoder::new();
+        let mut frames = Vec::new();
+        // Feed in odd-sized pieces so both the length prefix and bodies get split.
+        for chunk in wire.chunks(1337) {
+            decoder.push(chunk);
+            while let Some(frame) = decoder.next_frame().unwrap() {
+                frames.push(frame);
+            }
+        }
+        assert_eq!(frames, vec![a[4..].to_vec(), b[4..].to_vec()]);
+        assert!(decoder.next_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn frame_decoder_rejects_oversized_frames() {
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&((MAX_FRAME as u32) + 1).to_be_bytes());
+        assert!(decoder.next_frame().is_err());
     }
 
     #[test]
