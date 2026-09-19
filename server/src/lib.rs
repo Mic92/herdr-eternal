@@ -1046,10 +1046,14 @@ async fn attach(
                         return Ok(());
                     }
                     Event::Failed(err) => {
-                        if !session.resumable {
-                            sessions.remove(session_token);
-                            session.inbound.send(SessionInput::Abort).ok();
+                        if session.resumable {
+                            // Roaming/suspended clients drop without a close;
+                            // that is a detach, not a failure.
+                            debug!("resumable session detached: {err}");
+                            return Ok(());
                         }
+                        sessions.remove(session_token);
+                        session.inbound.send(SessionInput::Abort).ok();
                         return Err(err);
                     }
                 }
