@@ -54,6 +54,7 @@ impl Auth {
             oidc: oidc.map(|config| Oidc {
                 config,
                 jwks: Mutex::new(None),
+                warned_missing_aud: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -87,6 +88,7 @@ struct Oidc {
     config: OidcConfig,
     /// Cached JWKS; refetched when a token references an unknown key id.
     jwks: Mutex<Option<jsonwebtoken::jwk::JwkSet>>,
+    warned_missing_aud: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Deserialize)]
@@ -157,7 +159,12 @@ impl Oidc {
                 return Err(AuthError::WrongClient(client_id.clone()));
             }
         }
-        if claims.aud.is_empty() {
+        // A property of the IdP configuration, not of the connection: say it once.
+        if claims.aud.is_empty()
+            && !self
+                .warned_missing_aud
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
             tracing::warn!(
                 "accepting token without an audience; the identity provider does not grant one \
                  for this flow"
