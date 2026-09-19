@@ -18,6 +18,32 @@ fn herdr_available() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// herdr forks setsid() daemons; the scratch HOME is the only thing they share.
+fn kill_scratch_home_processes(home: &Path) {
+    let needle = format!("HOME={}", home.display());
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if pid as u32 == std::process::id() {
+            continue;
+        }
+        let Ok(environ) = std::fs::read(entry.path().join("environ")) else {
+            continue;
+        };
+        if environ
+            .split(|b| *b == 0)
+            .any(|var| var == needle.as_bytes())
+        {
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .ok();
+        }
+    }
+}
+
 fn write(path: &Path, contents: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, contents).unwrap();
@@ -104,8 +130,8 @@ async fn herdr_remote_bootstraps_over_the_transport() {
 
     // The remote herdr server is started lazily by the first client
     // connection through the bridge, and the client refuses to connect
-    // without a sized terminal. Give it a pty; stderr stays piped so
-    // bootstrap errors end up in the assertion message.
+    // without a sized terminal. stderr must not be a pipe: herdr's daemons
+    // inherit it and never close it.
     let pty = nix::pty::openpty(
         Some(&nix::pty::Winsize {
             ws_row: 24,
@@ -117,11 +143,12 @@ async fn herdr_remote_bootstraps_over_the_transport() {
     )
     .unwrap();
     let slave = pty.slave;
+    let stderr_path = home.join("herdr-stderr.log");
     let mut herdr = Command::new("herdr")
         .args(["--remote", "testbox"])
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave))
-        .stderr(Stdio::piped())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
         .spawn()
         .unwrap();
     let _master = pty.master;
@@ -137,12 +164,12 @@ async fn herdr_remote_bootstraps_over_the_transport() {
     }
 
     herdr.kill().ok();
-    let output = herdr.wait_with_output().unwrap();
-    Command::new("herdr").args(["server", "stop"]).status().ok();
+    herdr.wait().ok();
+    kill_scratch_home_processes(&home);
 
     assert!(
         started,
         "herdr --remote did not start the remote server over the transport.\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(&stderr_path).unwrap_or_default(),
     );
 }
