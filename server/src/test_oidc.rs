@@ -23,6 +23,15 @@ struct Inner {
     encoding_key: jsonwebtoken::EncodingKey,
     jwks: serde_json::Value,
     device_flow: Mutex<DeviceFlow>,
+    rotation: Mutex<Rotation>,
+}
+
+/// Single-use refresh tokens like Authelia's: every grant invalidates the
+/// previous token.
+struct Rotation {
+    enabled: bool,
+    current: String,
+    refreshes: u32,
 }
 
 /// State of the auto-approving device grant.
@@ -78,6 +87,11 @@ impl FakeIssuer {
             encoding_key,
             jwks,
             device_flow: Mutex::new(DeviceFlow::default()),
+            rotation: Mutex::new(Rotation {
+                enabled: false,
+                current: REFRESH_TOKEN.into(),
+                refreshes: 0,
+            }),
         });
 
         let router = axum::Router::new()
@@ -107,6 +121,17 @@ impl FakeIssuer {
             grant_sub: Some(sub.to_string()),
             pending_polls,
         };
+    }
+
+    /// Makes refresh tokens single-use, so a refresh with an already spent
+    /// token is rejected.
+    pub fn rotate_refresh_tokens(&self) {
+        self.inner.rotation.lock().unwrap().enabled = true;
+    }
+
+    /// Number of successful refresh-token grants so far.
+    pub fn refresh_count(&self) -> u32 {
+        self.inner.rotation.lock().unwrap().refreshes
     }
 
     /// Mints a signed token; `expires_in` may be negative to produce an
@@ -193,6 +218,12 @@ async fn token_grant(
     let client_id = form.get("client_id").cloned().unwrap_or_default();
     let grant_type = form.get("grant_type").map(String::as_str);
 
+    if grant_type == Some("refresh_token") {
+        // Widen the window in which concurrent refreshes overlap.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let mut rotation = inner.rotation.lock().unwrap();
     let sub = match grant_type {
         Some("urn:ietf:params:oauth:grant-type:device_code")
             if form.get("device_code").map(String::as_str) == Some(DEVICE_CODE) =>
@@ -204,15 +235,14 @@ async fn token_grant(
             }
             flow.grant_sub.clone()
         }
-        Some("refresh_token")
-            if form.get("refresh_token").map(String::as_str) == Some(REFRESH_TOKEN) =>
-        {
+        Some("refresh_token") if form.get("refresh_token") == Some(&rotation.current) => {
+            rotation.refreshes += 1;
             inner.device_flow.lock().unwrap().grant_sub.clone()
         }
         _ => None,
     };
     let Some(sub) = sub else {
-        return oauth_error("access_denied");
+        return oauth_error("invalid_grant");
     };
 
     // Mirror Authelia's device-code grant: sub and client_id claims, no aud.
@@ -221,10 +251,11 @@ async fn token_grant(
         "token_type": "Bearer",
         "expires_in": 3600,
     });
-    // Like providers without refresh-token rotation, the refresh grant does
-    // not hand out a new refresh token; clients must keep the old one.
     if grant_type != Some("refresh_token") {
-        body["refresh_token"] = REFRESH_TOKEN.into();
+        body["refresh_token"] = rotation.current.clone().into();
+    } else if rotation.enabled {
+        rotation.current = format!("rotated-refresh-token-{}", rotation.refreshes);
+        body["refresh_token"] = rotation.current.clone().into();
     }
     axum::Json(body).into_response()
 }
