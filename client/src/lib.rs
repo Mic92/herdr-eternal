@@ -47,6 +47,11 @@ pub enum ClientError {
     },
     #[error("oidc error: {0}")]
     Oidc(String),
+    #[error("{url} is rate limiting requests; retry in {retry_after:?}")]
+    RateLimited {
+        url: String,
+        retry_after: std::time::Duration,
+    },
     #[error("not logged in to {0}; run: herdr-eternal-ssh login {0}")]
     NotLoggedIn(String),
     #[error("target has neither a token nor issuer/client_id configured")]
