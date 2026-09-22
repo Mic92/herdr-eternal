@@ -114,10 +114,10 @@ async fn login_with_prompt(
         open_in_browser(url);
     }
 
-    let interval = std::time::Duration::from_secs(device.interval.unwrap_or(5));
+    let mut interval = std::time::Duration::from_secs(device.interval.unwrap_or(5));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(device.expires_in);
     let tokens = loop {
-        let response: Result<TokenResponse, String> = token_request(
+        let response = token_request::<TokenResponse>(
             &client,
             &discovery.token_endpoint,
             &[
@@ -126,17 +126,23 @@ async fn login_with_prompt(
                 ("client_id", oidc.client_id),
             ],
         )
-        .await?;
-        match response {
-            Ok(tokens) => break tokens,
-            Err(error) if error == "authorization_pending" || error == "slow_down" => {
-                if std::time::Instant::now() > deadline {
-                    return Err(ClientError::Oidc("device code expired".to_string()));
-                }
-                tokio::time::sleep(interval).await;
+        .await;
+        let wait = match response {
+            Ok(Ok(tokens)) => break tokens,
+            Ok(Err(error)) if error == "authorization_pending" => interval,
+            Ok(Err(error)) if error == "slow_down" => {
+                // RFC 8628 section 3.5: back off permanently by 5 seconds.
+                interval += std::time::Duration::from_secs(5);
+                interval
             }
-            Err(error) => return Err(ClientError::Oidc(format!("login failed: {error}"))),
+            Ok(Err(error)) => return Err(ClientError::Oidc(format!("login failed: {error}"))),
+            Err(ClientError::RateLimited { retry_after, .. }) => retry_after.max(interval),
+            Err(error) => return Err(error),
+        };
+        if std::time::Instant::now() + wait > deadline {
+            return Err(ClientError::Oidc("device code expired".to_string()));
         }
+        tokio::time::sleep(wait).await;
     };
 
     store_tokens(name, &tokens)?;
@@ -233,12 +239,32 @@ async fn token_request<T: serde::de::DeserializeOwned>(
         source: Box::new(source),
     };
     let response = client.post(url).form(form).send().await.map_err(map_err)?;
+    // Must not be reported as an OAuth error: callers would treat the refresh
+    // token as invalid and start yet another login, which feeds the limiter.
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(ClientError::RateLimited {
+            url: url.to_string(),
+            retry_after: retry_after(response.headers()),
+        });
+    }
     if response.status().is_client_error() {
         let error: TokenErrorResponse = response.json().await.map_err(map_err)?;
         return Ok(Err(error.error));
     }
     let response = response.error_for_status().map_err(map_err)?;
     Ok(Ok(response.json().await.map_err(map_err)?))
+}
+
+/// Parses the delay-seconds form of Retry-After; the HTTP-date form is not
+/// used by OIDC providers we target, so it falls back to a conservative delay.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> std::time::Duration {
+    const FALLBACK_SECS: u64 = 30;
+    let secs = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(FALLBACK_SECS);
+    std::time::Duration::from_secs(secs)
 }
 
 fn now_unix() -> u64 {

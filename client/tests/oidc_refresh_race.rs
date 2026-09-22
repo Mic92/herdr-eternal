@@ -1,7 +1,7 @@
 //! Concurrent clients must not race on single-use refresh tokens.
 
 use herdr_eternal_server::test_oidc::FakeIssuer;
-use herdr_eternal_ssh::{oidc, TargetConfig};
+use herdr_eternal_ssh::{TargetConfig, oidc};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_refreshes_share_one_grant() {
