@@ -147,7 +147,14 @@ async fn login_with_prompt(
 /// Returns a valid access token for `name`, refreshing it if necessary.
 pub async fn access_token(name: &str, target: &TargetConfig) -> Result<String, ClientError> {
     let oidc = oidc_target(target)?;
-    let cached = load_tokens(name)?.ok_or_else(|| ClientError::NotLoggedIn(name.to_string()))?;
+    let cached = load_cached_tokens(name)?;
+    if now_unix() + EXPIRY_MARGIN_SECS < cached.expires_at {
+        return Ok(cached.access_token);
+    }
+
+    // Rotated refresh tokens make concurrent refreshes fail, so serialize them.
+    let _lock = lock_token_cache(name).await?;
+    let cached = load_cached_tokens(name)?;
     if now_unix() + EXPIRY_MARGIN_SECS < cached.expires_at {
         return Ok(cached.access_token);
     }
@@ -254,6 +261,24 @@ fn token_cache_path(name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
+async fn lock_token_cache(name: &str) -> Result<std::fs::File, ClientError> {
+    let path = token_cache_path(name).with_extension("lock");
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        file.lock()?;
+        Ok(file)
+    })
+    .await
+    .map_err(|err| ClientError::Oidc(format!("token cache lock task failed: {err}")))?
+}
+
 fn store_tokens(name: &str, tokens: &TokenResponse) -> Result<(), ClientError> {
     let cached = CachedTokens {
         access_token: tokens.access_token.clone(),
@@ -268,14 +293,20 @@ fn store_tokens(name: &str, tokens: &TokenResponse) -> Result<(), ClientError> {
     // Tokens are secrets: create the file with owner-only permissions.
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("json.tmp");
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(&path)?;
+        .open(&tmp)?;
     file.write_all(&contents)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+fn load_cached_tokens(name: &str) -> Result<CachedTokens, ClientError> {
+    load_tokens(name)?.ok_or_else(|| ClientError::NotLoggedIn(name.to_string()))
 }
 
 fn load_tokens(name: &str) -> Result<Option<CachedTokens>, ClientError> {
