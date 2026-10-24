@@ -127,6 +127,24 @@ pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Protoco
     }
 }
 
+/// Keystrokes and their echo are usually the only packet in flight, so a
+/// lost one waits for QUIC's probe timeout (2-3 RTT). Such small messages are
+/// additionally sent as unreliable datagrams; receivers use whichever copy
+/// arrives first and must only apply a datagram if it is the next `seq`.
+pub fn worth_duplicating(msg: &ChannelMessage) -> bool {
+    matches!(
+        msg,
+        ChannelMessage::Stdin { data, .. }
+            | ChannelMessage::Stdout { data, .. }
+            | ChannelMessage::Stderr { data, .. }
+            if data.len() <= 512
+    )
+}
+
+/// Delay before the datagram copy so it does not share a packet (and thus
+/// its loss) with the stream copy.
+pub const DUPLICATE_DELAY: std::time::Duration = std::time::Duration::from_millis(3);
+
 /// Upper bound for a single stream frame; stdio chunks are 16 KiB.
 pub const MAX_FRAME: usize = 1024 * 1024;
 

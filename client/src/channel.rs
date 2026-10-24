@@ -20,9 +20,9 @@ pub(crate) enum Conn {
         recv: quinn::RecvStream,
         /// Holds partially received frames across cancelled `next()` calls.
         decoder: proto::FrameDecoder,
-        /// Keep the connection and its endpoint (whose driver carries the
-        /// connection's traffic) alive for as long as the channel is used.
-        _connection: quinn::Connection,
+        connection: quinn::Connection,
+        /// Keep the endpoint (whose driver carries the connection's
+        /// traffic) alive for as long as the channel is used.
         _endpoint: quinn::Endpoint,
     },
 }
@@ -30,6 +30,8 @@ pub(crate) enum Conn {
 /// What the connection produced next, uniform across transports.
 pub(crate) enum Event {
     Frame(Vec<u8>),
+    /// Unreliable copy of a message, see [`proto::worth_duplicating`].
+    Datagram(Vec<u8>),
     /// The connection closed or failed; the resume loop decides what's next.
     Disconnected,
 }
@@ -80,12 +82,33 @@ impl Conn {
         Ok(())
     }
 
+    /// Sends an unreliable QUIC datagram copy of small stdio messages.
+    pub(crate) fn send_duplicate(&self, msg: &proto::ChannelMessage) {
+        let Conn::Quic { connection, .. } = self else {
+            return;
+        };
+        if !proto::worth_duplicating(msg) {
+            return;
+        }
+        let Ok(bytes) = proto::encode(msg) else {
+            return;
+        };
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(proto::DUPLICATE_DELAY).await;
+            connection.send_datagram(bytes.into()).ok();
+        });
+    }
+
     /// Receives one message during the handshake; a lost connection there is
     /// a hard error.
     pub(crate) async fn recv<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, ClientError> {
-        match self.next().await? {
-            Event::Frame(bytes) => Ok(proto::decode(&bytes)?),
-            Event::Disconnected => Err(ClientError::ConnectionClosed),
+        loop {
+            match self.next().await? {
+                Event::Frame(bytes) => return Ok(proto::decode(&bytes)?),
+                Event::Datagram(_) => {}
+                Event::Disconnected => return Err(ClientError::ConnectionClosed),
+            }
         }
     }
 
@@ -105,15 +128,26 @@ impl Conn {
                     Some(Ok(_)) => continue,
                 }
             },
-            Conn::Quic { recv, decoder, .. } => loop {
+            Conn::Quic {
+                recv,
+                decoder,
+                connection,
+                ..
+            } => loop {
                 match decoder.next_frame() {
                     Ok(Some(frame)) => return Ok(Event::Frame(frame)),
                     Ok(None) => {}
                     Err(_) => return Ok(Event::Disconnected),
                 }
-                match recv.read_chunk(64 * 1024, true).await {
-                    Ok(Some(chunk)) => decoder.push(&chunk.bytes),
-                    Ok(None) | Err(_) => return Ok(Event::Disconnected),
+                tokio::select! {
+                    chunk = recv.read_chunk(64 * 1024, true) => match chunk {
+                        Ok(Some(chunk)) => decoder.push(&chunk.bytes),
+                        Ok(None) | Err(_) => return Ok(Event::Disconnected),
+                    },
+                    datagram = connection.read_datagram() => match datagram {
+                        Ok(datagram) => return Ok(Event::Datagram(datagram.to_vec())),
+                        Err(_) => return Ok(Event::Disconnected),
+                    },
                 }
             },
         }
@@ -179,7 +213,7 @@ async fn connect_quic(target: &Target, addr: &str) -> Result<Conn, ClientError> 
         send,
         recv,
         decoder: proto::FrameDecoder::new(),
-        _connection: connection,
+        connection,
         _endpoint: endpoint,
     })
 }
@@ -227,7 +261,7 @@ mod tests {
             send,
             recv,
             decoder: proto::FrameDecoder::new(),
-            _connection: connection,
+            connection,
             _endpoint: endpoint,
         };
         (conn, server_send)
@@ -265,7 +299,9 @@ mod tests {
                     proto::ChannelMessage::Stdout { seq: 7, .. }
                 ));
             }
-            Event::Disconnected => panic!("stream desynced after a cancelled read"),
+            Event::Disconnected | Event::Datagram(_) => {
+                panic!("stream desynced after a cancelled read")
+            }
         }
     }
 }
