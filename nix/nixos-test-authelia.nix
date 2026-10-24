@@ -66,14 +66,24 @@ pkgs.testers.runNixOSTest {
         };
       };
 
+      environment.etc = {
+        "authelia-test/storage-key".text = "an_insecure_test_only_storage_encryption_key_1234";
+        "authelia-test/jwt-secret".text = "an_insecure_test_only_jwt_secret_123456789012345678";
+        "authelia-test/session-secret".text = "an_insecure_test_only_session_secret_1234567890123";
+        "authelia-test/hmac-secret".text =
+          "an_insecure_test_only_oidc_hmac_secret_123456789012345678901234";
+        "authelia-test/oidc-issuer.pem".source = "${certs}/oidc-issuer.pem";
+      };
+
       services.authelia.instances.main = {
         enable = true;
+        # Secrets must not be store paths; /etc entries are fine for a test.
         secrets = {
-          storageEncryptionKeyFile = "${pkgs.writeText "storage-key" "an_insecure_test_only_storage_encryption_key_1234"}";
-          jwtSecretFile = "${pkgs.writeText "jwt-secret" "an_insecure_test_only_jwt_secret_123456789012345678"}";
-          sessionSecretFile = "${pkgs.writeText "session-secret" "an_insecure_test_only_session_secret_1234567890123"}";
-          oidcHmacSecretFile = "${pkgs.writeText "hmac-secret" "an_insecure_test_only_oidc_hmac_secret_123456789012345678901234"}";
-          oidcIssuerPrivateKeyFile = "${certs}/oidc-issuer.pem";
+          storageEncryptionKeyFile = "/etc/authelia-test/storage-key";
+          jwtSecretFile = "/etc/authelia-test/jwt-secret";
+          sessionSecretFile = "/etc/authelia-test/session-secret";
+          oidcHmacSecretFile = "/etc/authelia-test/hmac-secret";
+          oidcIssuerPrivateKeyFile = "/etc/authelia-test/oidc-issuer.pem";
         };
         settings = {
           # An authentication backend is mandatory even though the
@@ -136,10 +146,10 @@ pkgs.testers.runNixOSTest {
         " -d audience=${clientId}"
         " | jq -re .access_token"
     ).strip()
-    # Authelia omits sub on client_credentials tokens; the server falls back
-    # to client_id, so make sure this test keeps exercising that path.
+    # Older Authelia omitted sub on client_credentials tokens; that fallback
+    # to client_id is covered by server/tests/oidc.rs.
     claims = machine.succeed(f"echo '{token}' | cut -d. -f2 | base64 -d 2>/dev/null || true")
-    assert '"client_id":"${clientId}"' in claims and '"sub"' not in claims, claims
+    assert '"client_id":"${clientId}"' in claims, claims
 
     machine.succeed("mkdir -p /root/.config/herdr-eternal")
     machine.succeed(
