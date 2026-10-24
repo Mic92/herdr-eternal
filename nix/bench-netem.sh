@@ -16,10 +16,11 @@ declare -A profiles=(
   [lan]="delay 0.5ms"
   [dsl]="delay 12ms"
   [lte]="delay 30ms loss 1%"
+  [lossy]="delay 30ms loss 5%"
   [bad]="delay 75ms loss 3% rate 1mbit"
 )
 selected=("$@")
-[[ ${#selected[@]} -gt 0 ]] || selected=(lan dsl lte bad)
+[[ ${#selected[@]} -gt 0 ]] || selected=(lan dsl lte lossy bad)
 
 cargo build --release --quiet --example latency
 bin=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)/release/examples/latency
