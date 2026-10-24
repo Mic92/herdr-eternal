@@ -6,7 +6,10 @@ use herdr_eternal_ssh::{TargetConfig, oidc};
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_refreshes_share_one_grant() {
     let state_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_STATE_HOME", state_dir.path());
+    // SAFETY: only test in this binary, nothing reads the env concurrently.
+    unsafe {
+        std::env::set_var("XDG_STATE_HOME", state_dir.path());
+    }
 
     let issuer = FakeIssuer::start().await;
     issuer.rotate_refresh_tokens();
