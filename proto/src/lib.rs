@@ -1,6 +1,6 @@
 //! Wire protocol for the herdr-eternal transport.
 //!
-//! Transport-agnostic framed messages (`herdr-eternal/1`), carried over a
+//! Transport-agnostic framed messages (`herdr-eternal/2`), carried over a
 //! WebSocket connection or a QUIC bidi stream. Every data-bearing message
 //! carries a sequence number so a broken connection can be resumed
 //! byte-exactly in both directions.
@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Protocol identifier used for ALPN / WebSocket subprotocol negotiation.
-pub const PROTOCOL: &str = "herdr-eternal/1";
+pub const PROTOCOL: &str = "herdr-eternal/2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -16,7 +16,16 @@ pub enum ProtocolError {
     Encode(#[source] postcard::Error),
     #[error("failed to decode message: {0}")]
     Decode(#[source] postcard::Error),
+    #[error("failed to decompress message: {0}")]
+    Decompress(#[source] std::io::Error),
+    #[error("unknown message encoding {0}")]
+    UnknownEncoding(u8),
 }
+
+const ENC_RAW: u8 = 0;
+const ENC_ZSTD: u8 = 1;
+/// Smaller messages (keystrokes, acks) don't benefit from compression.
+const COMPRESS_MIN: usize = 64;
 
 /// First message sent by the client after the transport is established.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,12 +94,37 @@ pub enum ChannelMessage {
     AgentClose { id: u64 },
 }
 
+/// Messages are compressed independently so replay after resume needs no
+/// shared compressor state.
 pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, ProtocolError> {
-    postcard::to_stdvec(msg).map_err(ProtocolError::Encode)
+    let body = postcard::to_stdvec(msg).map_err(ProtocolError::Encode)?;
+    let (tag, payload) = if body.len() >= COMPRESS_MIN
+        && let Ok(compressed) = zstd::bulk::compress(&body, 3)
+        && compressed.len() < body.len()
+    {
+        (ENC_ZSTD, compressed)
+    } else {
+        (ENC_RAW, body)
+    };
+    let mut out = Vec::with_capacity(1 + payload.len());
+    out.push(tag);
+    out.extend_from_slice(&payload);
+    Ok(out)
 }
 
-pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, ProtocolError> {
-    postcard::from_bytes(bytes).map_err(ProtocolError::Decode)
+pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ProtocolError> {
+    match bytes.split_first() {
+        Some((&ENC_RAW, body)) => postcard::from_bytes(body).map_err(ProtocolError::Decode),
+        Some((&ENC_ZSTD, body)) => {
+            let body =
+                zstd::bulk::decompress(body, MAX_FRAME).map_err(ProtocolError::Decompress)?;
+            postcard::from_bytes(&body).map_err(ProtocolError::Decode)
+        }
+        Some((&other, _)) => Err(ProtocolError::UnknownEncoding(other)),
+        None => Err(ProtocolError::Decode(
+            postcard::Error::DeserializeUnexpectedEnd,
+        )),
+    }
 }
 
 /// Upper bound for a single stream frame; stdio chunks are 16 KiB.
@@ -196,6 +230,25 @@ mod tests {
         let mut decoder = FrameDecoder::new();
         decoder.push(&((MAX_FRAME as u32) + 1).to_be_bytes());
         assert!(decoder.next_frame().is_err());
+    }
+
+    #[test]
+    fn large_output_is_compressed_and_roundtrips() {
+        let data = b"drwxr-xr-x 2 joerg users 4096 ".repeat(500);
+        let msg = ChannelMessage::Stdout {
+            seq: 9,
+            data: data.clone(),
+        };
+        let bytes = encode(&msg).unwrap();
+        assert_eq!(bytes[0], ENC_ZSTD);
+        assert!(bytes.len() < data.len() / 10);
+        match decode(&bytes).unwrap() {
+            ChannelMessage::Stdout { seq, data: got } => {
+                assert_eq!(seq, 9);
+                assert_eq!(got, data);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 
     #[test]

@@ -81,7 +81,10 @@ async fn herdr_remote_bootstraps_over_the_transport() {
         .filter(|key| key.starts_with("HERDR_"))
         .collect();
     for key in herdr_vars {
-        std::env::remove_var(key);
+        // SAFETY: only test in this binary, nothing reads the env concurrently.
+        unsafe {
+            std::env::remove_var(key);
+        }
     }
 
     let home_dir = tempfile::tempdir().unwrap();
@@ -96,7 +99,10 @@ async fn herdr_remote_bootstraps_over_the_transport() {
         ("XDG_RUNTIME_DIR", home.join("run")),
     ] {
         std::fs::create_dir_all(&value).unwrap();
-        std::env::set_var(key, value);
+        // SAFETY: only test in this binary, nothing reads the env concurrently.
+        unsafe {
+            std::env::set_var(key, value);
+        }
     }
 
     let mut server = Server::bind(

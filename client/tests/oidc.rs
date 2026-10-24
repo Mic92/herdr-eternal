@@ -9,7 +9,10 @@ use herdr_eternal_ssh::{TargetConfig, oidc, run_exec};
 async fn login_and_exec_with_oidc() {
     // Token cache must not touch the developer's real state directory.
     let state_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_STATE_HOME", state_dir.path());
+    // SAFETY: only test in this binary, nothing reads the env concurrently.
+    unsafe {
+        std::env::set_var("XDG_STATE_HOME", state_dir.path());
+    }
 
     let issuer = FakeIssuer::start().await;
     // First poll is answered with authorization_pending to exercise polling.

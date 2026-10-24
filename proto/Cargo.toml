@@ -10,3 +10,4 @@ description = "Wire protocol for herdr-eternal transport (exec channels with res
 serde = { workspace = true }
 postcard = { workspace = true }
 thiserror = { workspace = true }
+zstd = { workspace = true }

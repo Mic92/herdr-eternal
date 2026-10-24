@@ -19,15 +19,35 @@ fn parse_ssh_args<I: IntoIterator<Item = String>>(args: I) -> Option<SshArgs> {
     let mut target = None;
     let mut command_parts = Vec::new();
 
+    // Mirror ssh(1)'s getopt string so any option herdr passes (-C, -p, -o,
+    // combined flags like -TC, ...) is skipped; none affect this transport.
+    const WITH_ARG: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+    const NO_ARG: &str = "46AaCfGgKkMNnqsTtVvXxYy";
+
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-F" | "-S" | "-o" => {
-                // Managed ssh options herdr may pass; irrelevant for this transport.
-                let _ = args.next();
+        if target.is_some() {
+            command_parts.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            target = args.next();
+            continue;
+        }
+        let Some(flags) = arg.strip_prefix('-').filter(|f| !f.is_empty()) else {
+            target = Some(arg);
+            continue;
+        };
+        for (i, c) in flags.char_indices() {
+            if WITH_ARG.contains(c) {
+                // Value is either attached (-p22) or the next argument.
+                if i + c.len_utf8() == flags.len() {
+                    let _ = args.next();
+                }
+                break;
             }
-            "-T" => {}
-            _ if target.is_none() => target = Some(arg),
-            _ => command_parts.push(arg),
+            if !NO_ARG.contains(c) {
+                break;
+            }
         }
     }
 
@@ -155,6 +175,30 @@ mod tests {
         let parsed = parse_ssh_args(args(&["-T", "user@host"])).unwrap();
         assert_eq!(parsed.target, "user@host");
         assert_eq!(parsed.command, None);
+    }
+
+    #[test]
+    fn skips_other_ssh_options() {
+        let parsed = parse_ssh_args(args(&[
+            "-C",
+            "-p",
+            "22",
+            "-oBatchMode=yes",
+            "-TC",
+            "-l",
+            "root",
+            "eve",
+            "uname",
+            "-m",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            SshArgs {
+                target: "eve".to_string(),
+                command: Some("uname -m".to_string()),
+            }
+        );
     }
 
     #[test]
