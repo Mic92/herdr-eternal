@@ -12,6 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 mod agent;
 mod channel;
 pub mod oidc;
+mod tls;
 use channel::{Conn, Event};
 
 #[derive(Debug, thiserror::Error)]

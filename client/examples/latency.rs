@@ -102,6 +102,10 @@ async fn bulk(target: &Target) {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
     let mut args = std::env::args().skip(1);
     let transport = args.next().unwrap_or_else(|| "quic".into());
     let n: usize = args.next().map_or(50, |n| n.parse().expect("iterations"));

@@ -2,12 +2,10 @@
 //! (behind nginx) as the fallback. Both carry the same postcard frames; on
 //! QUIC each frame is length-prefixed on a single bidirectional stream.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use herdr_eternal_proto as proto;
-use rustls_pki_types::pem::PemObject;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -54,18 +52,16 @@ impl Conn {
                 }
             }
         }
-        let (ws, _) = tokio_tungstenite::connect_async(&target.url)
-            .await
-            .map_err(Box::new)?;
-        // Keystroke-sized frames must not sit in Nagle's buffer.
-        let stream = match ws.get_ref() {
-            MaybeTlsStream::Plain(stream) => Some(stream),
-            MaybeTlsStream::Rustls(tls) => Some(tls.get_ref().0),
-            _ => None,
-        };
-        if let Some(stream) = stream {
-            stream.set_nodelay(true).ok();
-        }
+        let tls = Arc::new(crate::tls::client_config(None)?);
+        // disable_nagle: keystroke-sized frames must not sit in Nagle's buffer.
+        let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+            &target.url,
+            None,
+            true,
+            Some(tokio_tungstenite::Connector::Rustls(tls)),
+        )
+        .await
+        .map_err(Box::new)?;
         Ok(Conn::Ws(Box::new(ws)))
     }
 
@@ -138,35 +134,11 @@ impl Conn {
     }
 }
 
-/// TLS roots for the QUIC path: the system store plus an optional extra CA
-/// (self-signed setups, tests).
-fn quic_roots(extra_ca: Option<&Path>) -> Result<rustls::RootCertStore, ClientError> {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().certs {
-        roots.add(cert).ok();
-    }
-    if let Some(path) = extra_ca {
-        for cert in
-            rustls_pki_types::CertificateDer::pem_file_iter(path).map_err(std::io::Error::other)?
-        {
-            roots
-                .add(cert.map_err(std::io::Error::other)?)
-                .map_err(std::io::Error::other)?;
-        }
-    }
-    Ok(roots)
-}
-
 async fn connect_quic(target: &Target, addr: &str) -> Result<Conn, ClientError> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
     let (host, _port) = addr
         .rsplit_once(':')
         .ok_or_else(|| std::io::Error::other(format!("quic_addr {addr:?} is not host:port")))?;
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(quic_roots(target.quic_ca.as_deref())?)
-        .with_no_client_auth();
+    let mut tls = crate::tls::client_config(target.quic_ca.as_deref())?;
     tls.alpn_protocols = vec![proto::PROTOCOL.as_bytes().to_vec()];
 
     let quic_tls =

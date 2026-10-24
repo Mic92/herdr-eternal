@@ -84,8 +84,8 @@ async fn login_with_prompt(
     open_browser: bool,
 ) -> Result<(), ClientError> {
     let oidc = oidc_target(target)?;
-    let discovery = discover(oidc.issuer).await?;
-    let client = reqwest::Client::new();
+    let client = crate::tls::http_client()?;
+    let discovery = discover(&client, oidc.issuer).await?;
 
     let device: DeviceAuthorization = token_request(
         &client,
@@ -168,8 +168,8 @@ pub async fn access_token(name: &str, target: &TargetConfig) -> Result<String, C
     let Some(refresh_token) = cached.refresh_token else {
         return Err(ClientError::NotLoggedIn(name.to_string()));
     };
-    let discovery = discover(oidc.issuer).await?;
-    let client = reqwest::Client::new();
+    let client = crate::tls::http_client()?;
+    let discovery = discover(&client, oidc.issuer).await?;
     let mut tokens: TokenResponse = token_request(
         &client,
         &discovery.token_endpoint,
@@ -208,7 +208,7 @@ fn open_in_browser(url: &str) {
     }
 }
 
-async fn discover(issuer: &str) -> Result<Discovery, ClientError> {
+async fn discover(client: &reqwest::Client, issuer: &str) -> Result<Discovery, ClientError> {
     let url = format!(
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
@@ -217,7 +217,9 @@ async fn discover(issuer: &str) -> Result<Discovery, ClientError> {
         url: url.clone(),
         source: Box::new(source),
     };
-    reqwest::get(&url)
+    client
+        .get(&url)
+        .send()
         .await
         .and_then(|response| response.error_for_status())
         .map_err(map_err)?
