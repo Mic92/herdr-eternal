@@ -516,6 +516,7 @@ dependencies = [
  "herdr-eternal-proto",
  "herdr-eternal-server",
  "nix",
+ "openssl-probe",
  "quinn",
  "rcgen",
  "reqwest",
