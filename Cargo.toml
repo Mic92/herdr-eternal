@@ -4,7 +4,7 @@ members = ["proto", "server", "client"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 repository = "https://github.com/Mic92/herdr-eternal-server"
 
@@ -16,6 +16,7 @@ herdr-eternal-proto = { path = "proto" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
+zstd = { version = "0.13", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-std", "io-util", "sync", "time", "signal"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 nix = { version = "0.29", features = ["user", "fs", "signal", "socket"] }
