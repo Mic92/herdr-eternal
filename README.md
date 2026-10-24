@@ -16,6 +16,15 @@ notices.
 `nix/patches/0001-remote-make-ssh-transport-program-configurable.patch` until
 it is upstream).
 
+## Performance
+
+![Benchmark against OpenSSH](docs/bench.svg)
+
+Both sides compress (OpenSSH with `-C`, herdr-eternal always with zstd).
+Keystroke echo is one round trip for all three; under 5% loss its p99 is
+329 ms for OpenSSH, 428 ms over WebSocket and 64 ms over QUIC. Reproduce with
+`nix/bench-netem.sh [ssh|ws|quic]` (rootless netem on loopback).
+
 ## Server deployment (NixOS)
 
 ```nix
