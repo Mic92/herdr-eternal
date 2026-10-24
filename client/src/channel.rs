@@ -148,6 +148,8 @@ async fn connect_quic(target: &Target, addr: &str) -> Result<Conn, ClientError> 
     transport.keep_alive_interval(Some(target.keepalive_interval));
     // quinn's default (333ms) puts the first handshake retransmit at ~1s.
     transport.initial_rtt(std::time::Duration::from_millis(100));
+    // Cubic treats random (wireless) loss as congestion and collapses.
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport.max_idle_timeout(Some(
         target
             .keepalive_timeout
