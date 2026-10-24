@@ -66,10 +66,10 @@ impl Auth {
     /// Checks a token presented in Hello against the static token and, if
     /// configured, as an OIDC bearer token.
     pub async fn verify(&self, presented: &str) -> Result<(), AuthError> {
-        if let Some(static_token) = &self.static_token {
-            if constant_time_eq(static_token.as_bytes(), presented.as_bytes()) {
-                return Ok(());
-            }
+        if let Some(static_token) = &self.static_token
+            && constant_time_eq(static_token.as_bytes(), presented.as_bytes())
+        {
+            return Ok(());
         }
         let Some(oidc) = &self.oidc else {
             return Err(AuthError::Rejected);
@@ -154,10 +154,10 @@ impl Oidc {
         if !claims.aud.accepts(&self.config.client_id) {
             return Err(AuthError::WrongAudience);
         }
-        if let Some(client_id) = &claims.client_id {
-            if client_id != &self.config.client_id {
-                return Err(AuthError::WrongClient(client_id.clone()));
-            }
+        if let Some(client_id) = &claims.client_id
+            && client_id != &self.config.client_id
+        {
+            return Err(AuthError::WrongClient(client_id.clone()));
         }
         // A property of the IdP configuration, not of the connection: say it once.
         if claims.aud.is_empty()

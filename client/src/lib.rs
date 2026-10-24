@@ -247,14 +247,14 @@ pub async fn run_exec(
                 if resume_token.is_none() {
                     resume_token = token;
                 }
-                if agent_channel.is_none() {
-                    if let (Some(socket), Some(token)) = (&target.agent_socket, &resume_token) {
-                        agent_channel = Some(AbortOnDrop(tokio::spawn(agent::forward_agent(
-                            target.clone(),
-                            token.clone(),
-                            socket.clone(),
-                        ))));
-                    }
+                if agent_channel.is_none()
+                    && let (Some(socket), Some(token)) = (&target.agent_socket, &resume_token)
+                {
+                    agent_channel = Some(AbortOnDrop(tokio::spawn(agent::forward_agent(
+                        target.clone(),
+                        token.clone(),
+                        socket.clone(),
+                    ))));
                 }
                 conn
             }

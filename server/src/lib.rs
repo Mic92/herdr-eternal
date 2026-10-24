@@ -851,22 +851,20 @@ async fn session_task(
                     }
                 }
                 // Reap the wrapper when this daemon is its parent.
-                if exit_code.is_some() {
-                    if let Some(child) = child.as_mut() {
+                if exit_code.is_some()
+                    && let Some(child) = child.as_mut() {
                         child.wait().await.ok();
                     }
-                }
             }
             input = inbound.recv() => {
                 match input {
                     Some(SessionInput::Message(proto::ChannelMessage::Stdin { seq, data })) => {
                         if seq > last_client_seq {
                             last_client_seq = seq;
-                            if let Some(pipe) = stdin.as_mut() {
-                                if pipe.write_all(&data).await.is_err() || pipe.flush().await.is_err() {
+                            if let Some(pipe) = stdin.as_mut()
+                                && (pipe.write_all(&data).await.is_err() || pipe.flush().await.is_err()) {
                                     stdin = None;
                                 }
-                            }
                             stdin_applied.store(last_client_seq, Ordering::Relaxed);
                         }
                     }
@@ -885,11 +883,10 @@ async fn session_task(
                         // child keeps running unsupervised until the next
                         // daemon instance picks the session up again.
                         let mut fds = Vec::new();
-                        if let Some(pipe) = stdin.take() {
-                            if let Ok(fd) = pipe.into_nonblocking_fd() {
+                        if let Some(pipe) = stdin.take()
+                            && let Ok(fd) = pipe.into_nonblocking_fd() {
                                 fds.push(("stdin", fd));
                             }
-                        }
                         for (role, pipe, open) in [
                             ("stdout", stdout, stdout_open),
                             ("stderr", stderr, stderr_open),
@@ -931,12 +928,13 @@ async fn session_task(
             }
         }
 
-        if let Some(code) = exit_code {
-            if !stdout_open && !stderr_open {
-                seq += 1;
-                log.push(proto::ChannelMessage::Exit { seq, code });
-                return;
-            }
+        if let Some(code) = exit_code
+            && !stdout_open
+            && !stderr_open
+        {
+            seq += 1;
+            log.push(proto::ChannelMessage::Exit { seq, code });
+            return;
         }
     }
 }
