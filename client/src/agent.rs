@@ -39,11 +39,11 @@ async fn connect_agent_channel(target: &Target, resume_token: &str) -> Result<Co
         client_version: env!("CARGO_PKG_VERSION").to_string(),
     })
     .await?;
-    let _welcome: proto::Welcome = conn.recv().await?;
     conn.send(&proto::ExecRequest::AgentChannel {
         resume_token: resume_token.to_string(),
     })
     .await?;
+    let _welcome: proto::Welcome = conn.recv().await?;
     Ok(conn)
 }
 
