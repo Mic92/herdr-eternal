@@ -391,8 +391,9 @@ async fn connect_and_start(
         client_version: env!("CARGO_PKG_VERSION").to_string(),
     })
     .await?;
-    let _welcome: proto::Welcome = conn.recv().await?;
 
+    // Sent without waiting for Welcome to save a round trip; the server
+    // reads the request only after authenticating Hello.
     let request = match resume_token {
         Some(resume_token) => proto::ExecRequest::Resume {
             resume_token: resume_token.clone(),
@@ -405,6 +406,7 @@ async fn connect_and_start(
         },
     };
     conn.send(&request).await?;
+    let _welcome: proto::Welcome = conn.recv().await?;
 
     match conn.recv().await? {
         proto::ChannelMessage::Started { resume_token } => Ok((conn, resume_token)),
