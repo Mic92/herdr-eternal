@@ -2,12 +2,60 @@
 //! under `nix/bench-netem.sh` to add realistic delay/loss to `lo`.
 //!
 //! usage: latency [ws|quic] [iterations]
+//!        latency ssh [iterations] <ssh argv...>
 
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use herdr_eternal_server::{Auth, Server};
 use herdr_eternal_ssh::{Target, run_exec};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+#[derive(Clone)]
+enum Backend {
+    Eternal(Target),
+    Ssh(Vec<String>),
+}
+
+impl Backend {
+    async fn exec(
+        &self,
+        cmd: &str,
+        mut stdin: impl AsyncRead + Unpin + Send + 'static,
+        mut stdout: impl AsyncWrite + Unpin + Send + 'static,
+    ) -> i32 {
+        match self {
+            Backend::Eternal(target) => run_exec(target, cmd, stdin, stdout, tokio::io::sink())
+                .await
+                .unwrap(),
+            Backend::Ssh(argv) => {
+                let mut child = tokio::process::Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .arg(cmd)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut child_in = child.stdin.take().unwrap();
+                let mut child_out = child.stdout.take().unwrap();
+                let input = tokio::spawn(async move {
+                    // Byte-wise so each keystroke is flushed immediately.
+                    let mut b = [0_u8; 1];
+                    while stdin.read(&mut b).await.unwrap_or(0) == 1 {
+                        if child_in.write_all(&b).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                tokio::io::copy(&mut child_out, &mut stdout).await.unwrap();
+                drop(stdout);
+                let status = child.wait().await.unwrap();
+                input.abort();
+                status.code().unwrap_or(-1)
+            }
+        }
+    }
+}
 
 fn report(name: &str, mut samples: Vec<Duration>) {
     samples.sort();
@@ -21,19 +69,13 @@ fn report(name: &str, mut samples: Vec<Duration>) {
     );
 }
 
-async fn connect(target: &Target, n: usize) {
+async fn connect(backend: &Backend, n: usize) {
     let mut samples = Vec::with_capacity(n);
     for _ in 0..n {
         let start = Instant::now();
-        let code = run_exec(
-            target,
-            "true",
-            tokio::io::empty(),
-            tokio::io::sink(),
-            tokio::io::sink(),
-        )
-        .await
-        .unwrap();
+        let code = backend
+            .exec("true", tokio::io::empty(), tokio::io::sink())
+            .await;
         assert_eq!(code, 0);
         samples.push(start.elapsed());
     }
@@ -41,14 +83,11 @@ async fn connect(target: &Target, n: usize) {
 }
 
 /// Keystroke round trip: one byte to a remote `cat` and back.
-async fn echo(target: &Target, n: usize) {
+async fn echo(backend: &Backend, n: usize) {
     let (mut input, stdin) = tokio::io::duplex(64);
     let (stdout, mut output) = tokio::io::duplex(64);
-    let target = target.clone();
-    let exec =
-        tokio::spawn(
-            async move { run_exec(&target, "cat", stdin, stdout, tokio::io::sink()).await },
-        );
+    let backend = backend.clone();
+    let exec = tokio::spawn(async move { backend.exec("cat", stdin, stdout).await });
 
     let mut byte = [0_u8; 1];
     // Warm-up: the first echo also pays for connection setup.
@@ -64,21 +103,16 @@ async fn echo(target: &Target, n: usize) {
     }
     report("echo", samples);
     drop(input);
-    exec.await.unwrap().unwrap();
+    exec.await.unwrap();
 }
 
-async fn bulk(target: &Target) {
+async fn bulk(backend: &Backend) {
     let (stdout, mut output) = tokio::io::duplex(64 * 1024);
-    let target = target.clone();
+    let backend = backend.clone();
     let exec = tokio::spawn(async move {
-        run_exec(
-            &target,
-            "seq 2000000",
-            tokio::io::empty(),
-            stdout,
-            tokio::io::sink(),
-        )
-        .await
+        backend
+            .exec("seq 2000000", tokio::io::empty(), stdout)
+            .await
     });
     let start = Instant::now();
     let mut total = 0;
@@ -91,7 +125,7 @@ async fn bulk(target: &Target) {
         total += n;
     }
     let elapsed = start.elapsed();
-    exec.await.unwrap().unwrap();
+    exec.await.unwrap();
     println!(
         "bulk       {:.1} MiB in {:.2}s = {:.1} MiB/s",
         total as f64 / 1048576.0,
@@ -109,6 +143,15 @@ async fn main() {
     let mut args = std::env::args().skip(1);
     let transport = args.next().unwrap_or_else(|| "quic".into());
     let n: usize = args.next().map_or(50, |n| n.parse().expect("iterations"));
+
+    if transport == "ssh" {
+        let backend = Backend::Ssh(args.collect());
+        println!("transport=ssh");
+        connect(&backend, n).await;
+        echo(&backend, n).await;
+        bulk(&backend).await;
+        return;
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
@@ -138,11 +181,12 @@ async fn main() {
             target.quic_addr = Some(quic_addr.to_string());
             target.quic_ca = Some(cert_path.clone());
         }
-        other => panic!("unknown transport {other}, expected ws or quic"),
+        other => panic!("unknown transport {other}, expected ws, quic or ssh"),
     }
 
+    let backend = Backend::Eternal(target);
     println!("transport={transport}");
-    connect(&target, n).await;
-    echo(&target, n).await;
-    bulk(&target).await;
+    connect(&backend, n).await;
+    echo(&backend, n).await;
+    bulk(&backend).await;
 }
