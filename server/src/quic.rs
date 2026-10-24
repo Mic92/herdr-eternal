@@ -51,6 +51,8 @@ pub(crate) fn listen(
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
     transport.initial_rtt(INITIAL_RTT);
+    // Cubic treats random (wireless) loss as congestion and collapses.
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport.max_idle_timeout(Some(
         IDLE_TIMEOUT.try_into().map_err(std::io::Error::other)?,
     ));
