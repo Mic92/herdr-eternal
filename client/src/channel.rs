@@ -229,7 +229,7 @@ mod tests {
             .ok();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = cert.cert.der().clone();
-        let key = rustls_pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let key = rustls_pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
         let server_config =
             quinn::ServerConfig::with_single_cert(vec![cert_der.clone()], key.into()).unwrap();
         let server =
