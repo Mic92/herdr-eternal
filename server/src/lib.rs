@@ -216,6 +216,7 @@ impl Server {
                         send,
                         recv,
                         decoder: proto::FrameDecoder::new(),
+                        connection,
                     })
                 };
                 match channel.await {
@@ -454,6 +455,8 @@ impl OutboundLog {
 
 enum SessionInput {
     Message(proto::ChannelMessage),
+    /// Unreliable duplicate that may overtake earlier stream messages.
+    Datagram(proto::ChannelMessage),
     /// The attached client went away and the session is not resumable.
     Abort,
     /// The daemon is shutting down: give the session's state and pipe fds
@@ -861,13 +864,19 @@ async fn session_task(
                     Some(SessionInput::Message(proto::ChannelMessage::Stdin { seq, data })) => {
                         if seq > last_client_seq {
                             last_client_seq = seq;
-                            if let Some(pipe) = stdin.as_mut()
-                                && (pipe.write_all(&data).await.is_err() || pipe.flush().await.is_err()) {
-                                    stdin = None;
-                                }
+                            write_stdin(&mut stdin, &data).await;
                             stdin_applied.store(last_client_seq, Ordering::Relaxed);
                         }
                     }
+                    // Datagrams may overtake earlier stream messages.
+                    Some(SessionInput::Datagram(proto::ChannelMessage::Stdin { seq, data })) => {
+                        if seq == last_client_seq + 1 {
+                            last_client_seq = seq;
+                            write_stdin(&mut stdin, &data).await;
+                            stdin_applied.store(last_client_seq, Ordering::Relaxed);
+                        }
+                    }
+                    Some(SessionInput::Datagram(_)) => {}
                     Some(SessionInput::Message(proto::ChannelMessage::StdinEof { seq })) => {
                         if seq > last_client_seq {
                             last_client_seq = seq;
@@ -939,6 +948,15 @@ async fn session_task(
     }
 }
 
+/// Writes client input to the child; a broken pipe closes stdin for good.
+async fn write_stdin(stdin: &mut Option<pipe::Sender>, data: &[u8]) {
+    if let Some(pipe) = stdin.as_mut()
+        && (pipe.write_all(data).await.is_err() || pipe.flush().await.is_err())
+    {
+        *stdin = None;
+    }
+}
+
 /// Streams the session's outbound log to this connection (starting after
 /// `sent_up_to`) and forwards its inbound messages to the session.
 /// Rejects a request explicitly so the client stops retrying.
@@ -987,6 +1005,7 @@ async fn attach(
                 exit_seq = Some(seq);
             }
             channel.send(&message).await?;
+            channel.send_duplicate(&message);
             sent_up_to += 1;
         }
 
@@ -1020,6 +1039,12 @@ async fn attach(
             event = channel.next() => {
                 last_activity = tokio::time::Instant::now();
                 match event {
+                    Event::Datagram(bytes) => {
+                        // A bad duplicate is harmless: the stream copy follows.
+                        if let Ok(message) = proto::decode(&bytes) {
+                            session.inbound.send(SessionInput::Datagram(message)).ok();
+                        }
+                    }
                     Event::Frame(bytes) => {
                         match proto::decode(&bytes)? {
                             proto::ChannelMessage::Ack { seq } => {

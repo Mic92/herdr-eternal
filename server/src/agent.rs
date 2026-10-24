@@ -212,6 +212,7 @@ pub(crate) async fn handle_agent_channel(
                             }
                             other => debug!(?other, "ignoring message on agent channel"),
                         },
+                        crate::Event::Datagram(_) => {}
                         crate::Event::Closed => return Ok(()),
                         crate::Event::Failed(err) => return Err(err),
                     }

@@ -89,6 +89,7 @@ async fn relay_agent_channel(mut conn: Conn, agent_socket: &Path) {
                             _ => {}
                         }
                     }
+                    Ok(Event::Datagram(_)) => {}
                     Ok(Event::Disconnected) | Err(_) => return,
                 }
             }
