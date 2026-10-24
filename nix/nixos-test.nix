@@ -6,7 +6,7 @@
   package,
 }:
 let
-  # Self-signed cert for the QUIC listener; only used inside the test VM.
+  # Self-signed cert for the QUIC listener; only used inside the test container.
   quicCert = pkgs.runCommand "herdr-eternal-test-cert" { nativeBuildInputs = [ pkgs.openssl ]; } ''
     mkdir -p $out
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 \
@@ -18,7 +18,7 @@ in
 pkgs.testers.runNixOSTest {
   name = "herdr-eternal-server";
 
-  nodes.machine =
+  containers.machine =
     { pkgs, ... }:
     {
       imports = [ nixosModule ];
@@ -29,6 +29,8 @@ pkgs.testers.runNixOSTest {
       users.users.alice = {
         shell = pkgs.zsh;
         isNormalUser = true;
+        # No password, but not locked: sshd rejects locked accounts.
+        hashedPassword = "*";
       };
 
       services.herdr-eternal-server = {
@@ -50,6 +52,9 @@ pkgs.testers.runNixOSTest {
 
       # Target for real ssh authentication through the forwarded agent.
       services.openssh.enable = true;
+      # Store paths are not root-owned inside the uid-mapped container, so
+      # ssh rejects this Include.
+      programs.ssh.systemd-ssh-proxy.enable = false;
 
       environment.systemPackages = [
         package
