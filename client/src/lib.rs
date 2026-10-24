@@ -12,6 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 mod agent;
 mod channel;
 pub mod oidc;
+mod tls;
 use channel::{Conn, Event};
 
 #[derive(Debug, thiserror::Error)]
@@ -247,14 +248,14 @@ pub async fn run_exec(
                 if resume_token.is_none() {
                     resume_token = token;
                 }
-                if agent_channel.is_none() {
-                    if let (Some(socket), Some(token)) = (&target.agent_socket, &resume_token) {
-                        agent_channel = Some(AbortOnDrop(tokio::spawn(agent::forward_agent(
-                            target.clone(),
-                            token.clone(),
-                            socket.clone(),
-                        ))));
-                    }
+                if agent_channel.is_none()
+                    && let (Some(socket), Some(token)) = (&target.agent_socket, &resume_token)
+                {
+                    agent_channel = Some(AbortOnDrop(tokio::spawn(agent::forward_agent(
+                        target.clone(),
+                        token.clone(),
+                        socket.clone(),
+                    ))));
                 }
                 conn
             }
@@ -315,22 +316,31 @@ pub async fn run_exec(
                         } else {
                             proto::ChannelMessage::Stdin { seq: client_seq, data: stdin_buf[..n].to_vec() }
                         };
-                        sent_stdin.push(message.clone());
                         if conn.send(&message).await.is_err() {
                             return Ok(None);
                         }
+                        conn.send_duplicate(&message);
+                        sent_stdin.push(message);
                     }
                     event = conn.next() => {
                         last_activity = tokio::time::Instant::now();
-                        match event? {
-                            Event::Frame(bytes) => match proto::decode(&bytes)? {
-                                proto::ChannelMessage::Stdout { seq, data } if seq > last_server_seq => {
+                        let (message, reliable) = match event? {
+                            Event::Frame(bytes) => (proto::decode(&bytes)?, true),
+                            // A bad duplicate is harmless: the stream copy follows.
+                            Event::Datagram(bytes) => match proto::decode(&bytes) {
+                                Ok(message) => (message, false),
+                                Err(_) => continue,
+                            },
+                            Event::Disconnected => return Ok(None),
+                        };
+                        match message {
+                                proto::ChannelMessage::Stdout { seq, data } if is_next(seq, last_server_seq, reliable) => {
                                     last_server_seq = seq;
                                     stdout.write_all(&data).await?;
                                     stdout.flush().await?;
                                     ack(&mut conn, last_server_seq).await;
                                 }
-                                proto::ChannelMessage::Stderr { seq, data } if seq > last_server_seq => {
+                                proto::ChannelMessage::Stderr { seq, data } if is_next(seq, last_server_seq, reliable) => {
                                     last_server_seq = seq;
                                     stderr.write_all(&data).await?;
                                     stderr.flush().await?;
@@ -349,8 +359,6 @@ pub async fn run_exec(
                                     });
                                 }
                                 _ => {}
-                            },
-                            Event::Disconnected => return Ok(None),
                         }
                     }
                 }
@@ -367,6 +375,12 @@ pub async fn run_exec(
             Err(err) => return Err(err),
         }
     }
+}
+
+/// Datagram duplicates may overtake earlier stream messages, so they are
+/// only applied when they are exactly the next message.
+fn is_next(seq: u64, last_seen: u64, reliable: bool) -> bool {
+    seq == last_seen + 1 || (reliable && seq > last_seen)
 }
 
 /// Tells the server which of its messages we have persisted, so it can trim
@@ -391,8 +405,9 @@ async fn connect_and_start(
         client_version: env!("CARGO_PKG_VERSION").to_string(),
     })
     .await?;
-    let _welcome: proto::Welcome = conn.recv().await?;
 
+    // Sent without waiting for Welcome to save a round trip; the server
+    // reads the request only after authenticating Hello.
     let request = match resume_token {
         Some(resume_token) => proto::ExecRequest::Resume {
             resume_token: resume_token.clone(),
@@ -405,6 +420,7 @@ async fn connect_and_start(
         },
     };
     conn.send(&request).await?;
+    let _welcome: proto::Welcome = conn.recv().await?;
 
     match conn.recv().await? {
         proto::ChannelMessage::Started { resume_token } => Ok((conn, resume_token)),

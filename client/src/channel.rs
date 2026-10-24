@@ -2,12 +2,10 @@
 //! (behind nginx) as the fallback. Both carry the same postcard frames; on
 //! QUIC each frame is length-prefixed on a single bidirectional stream.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use herdr_eternal_proto as proto;
-use rustls_pki_types::pem::PemObject;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -22,9 +20,9 @@ pub(crate) enum Conn {
         recv: quinn::RecvStream,
         /// Holds partially received frames across cancelled `next()` calls.
         decoder: proto::FrameDecoder,
-        /// Keep the connection and its endpoint (whose driver carries the
-        /// connection's traffic) alive for as long as the channel is used.
-        _connection: quinn::Connection,
+        connection: quinn::Connection,
+        /// Keep the endpoint (whose driver carries the connection's
+        /// traffic) alive for as long as the channel is used.
         _endpoint: quinn::Endpoint,
     },
 }
@@ -32,6 +30,8 @@ pub(crate) enum Conn {
 /// What the connection produced next, uniform across transports.
 pub(crate) enum Event {
     Frame(Vec<u8>),
+    /// Unreliable copy of a message, see [`proto::worth_duplicating`].
+    Datagram(Vec<u8>),
     /// The connection closed or failed; the resume loop decides what's next.
     Disconnected,
 }
@@ -54,18 +54,16 @@ impl Conn {
                 }
             }
         }
-        let (ws, _) = tokio_tungstenite::connect_async(&target.url)
-            .await
-            .map_err(Box::new)?;
-        // Keystroke-sized frames must not sit in Nagle's buffer.
-        let stream = match ws.get_ref() {
-            MaybeTlsStream::Plain(stream) => Some(stream),
-            MaybeTlsStream::Rustls(tls) => Some(tls.get_ref().0),
-            _ => None,
-        };
-        if let Some(stream) = stream {
-            stream.set_nodelay(true).ok();
-        }
+        let tls = Arc::new(crate::tls::client_config(None)?);
+        // disable_nagle: keystroke-sized frames must not sit in Nagle's buffer.
+        let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+            &target.url,
+            None,
+            true,
+            Some(tokio_tungstenite::Connector::Rustls(tls)),
+        )
+        .await
+        .map_err(Box::new)?;
         Ok(Conn::Ws(Box::new(ws)))
     }
 
@@ -84,12 +82,33 @@ impl Conn {
         Ok(())
     }
 
+    /// Sends an unreliable QUIC datagram copy of small stdio messages.
+    pub(crate) fn send_duplicate(&self, msg: &proto::ChannelMessage) {
+        let Conn::Quic { connection, .. } = self else {
+            return;
+        };
+        if !proto::worth_duplicating(msg) {
+            return;
+        }
+        let Ok(bytes) = proto::encode(msg) else {
+            return;
+        };
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(proto::DUPLICATE_DELAY).await;
+            connection.send_datagram(bytes.into()).ok();
+        });
+    }
+
     /// Receives one message during the handshake; a lost connection there is
     /// a hard error.
     pub(crate) async fn recv<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, ClientError> {
-        match self.next().await? {
-            Event::Frame(bytes) => Ok(proto::decode(&bytes)?),
-            Event::Disconnected => Err(ClientError::ConnectionClosed),
+        loop {
+            match self.next().await? {
+                Event::Frame(bytes) => return Ok(proto::decode(&bytes)?),
+                Event::Datagram(_) => {}
+                Event::Disconnected => return Err(ClientError::ConnectionClosed),
+            }
         }
     }
 
@@ -109,15 +128,26 @@ impl Conn {
                     Some(Ok(_)) => continue,
                 }
             },
-            Conn::Quic { recv, decoder, .. } => loop {
+            Conn::Quic {
+                recv,
+                decoder,
+                connection,
+                ..
+            } => loop {
                 match decoder.next_frame() {
                     Ok(Some(frame)) => return Ok(Event::Frame(frame)),
                     Ok(None) => {}
                     Err(_) => return Ok(Event::Disconnected),
                 }
-                match recv.read_chunk(64 * 1024, true).await {
-                    Ok(Some(chunk)) => decoder.push(&chunk.bytes),
-                    Ok(None) | Err(_) => return Ok(Event::Disconnected),
+                tokio::select! {
+                    chunk = recv.read_chunk(64 * 1024, true) => match chunk {
+                        Ok(Some(chunk)) => decoder.push(&chunk.bytes),
+                        Ok(None) | Err(_) => return Ok(Event::Disconnected),
+                    },
+                    datagram = connection.read_datagram() => match datagram {
+                        Ok(datagram) => return Ok(Event::Datagram(datagram.to_vec())),
+                        Err(_) => return Ok(Event::Disconnected),
+                    },
                 }
             },
         }
@@ -138,35 +168,11 @@ impl Conn {
     }
 }
 
-/// TLS roots for the QUIC path: the system store plus an optional extra CA
-/// (self-signed setups, tests).
-fn quic_roots(extra_ca: Option<&Path>) -> Result<rustls::RootCertStore, ClientError> {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().certs {
-        roots.add(cert).ok();
-    }
-    if let Some(path) = extra_ca {
-        for cert in
-            rustls_pki_types::CertificateDer::pem_file_iter(path).map_err(std::io::Error::other)?
-        {
-            roots
-                .add(cert.map_err(std::io::Error::other)?)
-                .map_err(std::io::Error::other)?;
-        }
-    }
-    Ok(roots)
-}
-
 async fn connect_quic(target: &Target, addr: &str) -> Result<Conn, ClientError> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
     let (host, _port) = addr
         .rsplit_once(':')
         .ok_or_else(|| std::io::Error::other(format!("quic_addr {addr:?} is not host:port")))?;
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(quic_roots(target.quic_ca.as_deref())?)
-        .with_no_client_auth();
+    let mut tls = crate::tls::client_config(target.quic_ca.as_deref())?;
     tls.alpn_protocols = vec![proto::PROTOCOL.as_bytes().to_vec()];
 
     let quic_tls =
@@ -174,6 +180,10 @@ async fn connect_quic(target: &Target, addr: &str) -> Result<Conn, ClientError> 
     let mut config = quinn::ClientConfig::new(Arc::new(quic_tls));
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(target.keepalive_interval));
+    // quinn's default (333ms) puts the first handshake retransmit at ~1s.
+    transport.initial_rtt(std::time::Duration::from_millis(100));
+    // Cubic treats random (wireless) loss as congestion and collapses.
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport.max_idle_timeout(Some(
         target
             .keepalive_timeout
@@ -203,7 +213,7 @@ async fn connect_quic(target: &Target, addr: &str) -> Result<Conn, ClientError> 
         send,
         recv,
         decoder: proto::FrameDecoder::new(),
-        _connection: connection,
+        connection,
         _endpoint: endpoint,
     })
 }
@@ -251,7 +261,7 @@ mod tests {
             send,
             recv,
             decoder: proto::FrameDecoder::new(),
-            _connection: connection,
+            connection,
             _endpoint: endpoint,
         };
         (conn, server_send)
@@ -289,7 +299,9 @@ mod tests {
                     proto::ChannelMessage::Stdout { seq: 7, .. }
                 ));
             }
-            Event::Disconnected => panic!("stream desynced after a cancelled read"),
+            Event::Disconnected | Event::Datagram(_) => {
+                panic!("stream desynced after a cancelled read")
+            }
         }
     }
 }

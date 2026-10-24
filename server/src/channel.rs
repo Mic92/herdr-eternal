@@ -17,12 +17,15 @@ pub(crate) enum Channel {
         recv: quinn::RecvStream,
         /// Holds partially received frames across cancelled `next()` calls.
         decoder: proto::FrameDecoder,
+        connection: quinn::Connection,
     },
 }
 
 /// What a connection produced next, uniform across transports.
 pub(crate) enum Event {
     Frame(Vec<u8>),
+    /// Unreliable copy of a message, see [`proto::worth_duplicating`].
+    Datagram(Vec<u8>),
     /// Peer closed the connection in an orderly way.
     Closed,
     Failed(ServerError),
@@ -44,13 +47,34 @@ impl Channel {
         Ok(())
     }
 
+    /// Sends an unreliable QUIC datagram copy of small stdio messages.
+    pub(crate) fn send_duplicate(&self, msg: &proto::ChannelMessage) {
+        let Channel::Quic { connection, .. } = self else {
+            return;
+        };
+        if !proto::worth_duplicating(msg) {
+            return;
+        }
+        let Ok(bytes) = proto::encode(msg) else {
+            return;
+        };
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(proto::DUPLICATE_DELAY).await;
+            connection.send_datagram(bytes.into()).ok();
+        });
+    }
+
     /// Receives one message during the handshake; a closed connection is an
     /// error at that stage.
     pub(crate) async fn recv<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, ServerError> {
-        match self.next().await {
-            Event::Frame(bytes) => Ok(proto::decode(&bytes)?),
-            Event::Closed => Err(ServerError::HandshakeClosed),
-            Event::Failed(err) => Err(err),
+        loop {
+            match self.next().await {
+                Event::Frame(bytes) => return Ok(proto::decode(&bytes)?),
+                Event::Datagram(_) => {}
+                Event::Closed => return Err(ServerError::HandshakeClosed),
+                Event::Failed(err) => return Err(err),
+            }
         }
     }
 
@@ -68,16 +92,27 @@ impl Channel {
                     Some(Err(err)) => return Event::Failed(Box::new(err).into()),
                 }
             },
-            Channel::Quic { recv, decoder, .. } => loop {
+            Channel::Quic {
+                recv,
+                decoder,
+                connection,
+                ..
+            } => loop {
                 match decoder.next_frame() {
                     Ok(Some(frame)) => return Event::Frame(frame),
                     Ok(None) => {}
                     Err(err) => return Event::Failed(std::io::Error::other(err).into()),
                 }
-                match recv.read_chunk(64 * 1024, true).await {
-                    Ok(Some(chunk)) => decoder.push(&chunk.bytes),
-                    Ok(None) => return Event::Closed,
-                    Err(err) => return Event::Failed(std::io::Error::other(err).into()),
+                tokio::select! {
+                    chunk = recv.read_chunk(64 * 1024, true) => match chunk {
+                        Ok(Some(chunk)) => decoder.push(&chunk.bytes),
+                        Ok(None) => return Event::Closed,
+                        Err(err) => return Event::Failed(std::io::Error::other(err).into()),
+                    },
+                    datagram = connection.read_datagram() => match datagram {
+                        Ok(datagram) => return Event::Datagram(datagram.to_vec()),
+                        Err(err) => return Event::Failed(std::io::Error::other(err).into()),
+                    },
                 }
             },
         }

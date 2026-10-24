@@ -39,11 +39,11 @@ async fn connect_agent_channel(target: &Target, resume_token: &str) -> Result<Co
         client_version: env!("CARGO_PKG_VERSION").to_string(),
     })
     .await?;
-    let _welcome: proto::Welcome = conn.recv().await?;
     conn.send(&proto::ExecRequest::AgentChannel {
         resume_token: resume_token.to_string(),
     })
     .await?;
+    let _welcome: proto::Welcome = conn.recv().await?;
     Ok(conn)
 }
 
@@ -89,6 +89,7 @@ async fn relay_agent_channel(mut conn: Conn, agent_socket: &Path) {
                             _ => {}
                         }
                     }
+                    Ok(Event::Datagram(_)) => {}
                     Ok(Event::Disconnected) | Err(_) => return,
                 }
             }

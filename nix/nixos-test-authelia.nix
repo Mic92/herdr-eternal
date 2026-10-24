@@ -29,7 +29,7 @@ in
 pkgs.testers.runNixOSTest {
   name = "herdr-eternal-server-authelia";
 
-  nodes.machine =
+  containers.machine =
     { pkgs, ... }:
     {
       imports = [ nixosModule ];
