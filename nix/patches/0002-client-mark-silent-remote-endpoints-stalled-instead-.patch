@@ -1,0 +1,287 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=B6rg=20Thalheim?= <joerg@thalheim.io>
+Date: Mon, 2 Nov 2026 10:30:32 +0100
+Subject: [PATCH 2/4] client: mark silent remote endpoints stalled instead of
+ tearing them down
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An unanswered health probe used to disconnect the endpoint after 10s,
+killing the ssh_command bridge and starting a cold reconnect (bootstrap,
+handshake, full snapshot) behind an exponential backoff of up to 120s.
+
+That defeats roaming transports configured via remote.ssh_command, such
+as Eternal Terminal: they keep the stdio pipe open while the network is
+gone (train tunnel, suspend, Wi-Fi handover) and resume byte-exactly when
+it returns. Tearing the bridge down orphans that session, and after a
+few minutes offline the next herdr retry can be two minutes away.
+
+Treat a missed probe as a stall instead: the connection stays up, and
+the active surface stops accepting input so keystrokes typed blind are
+dropped rather than replayed into a shell later. Any incoming message
+clears the stall. A transport that is really dead is still detected by
+the bridge process exiting (OpenSSH via ServerAliveInterval), and a
+connection that never delivers its initial snapshot still expires.
+
+Probe faster (2s idle, 2s to stall) so a stall is noticed in seconds.
+
+Signed-off-by: Jörg Thalheim <joerg@thalheim.io>
+---
+ src/client/endpoint/health.rs   | 45 +++++++++++++++----
+ src/client/endpoint/registry.rs | 80 +++++++++++++++++++++++++++------
+ 2 files changed, 102 insertions(+), 23 deletions(-)
+
+diff --git a/src/client/endpoint/health.rs b/src/client/endpoint/health.rs
+index 87c08952..79bcb20f 100644
+--- a/src/client/endpoint/health.rs
++++ b/src/client/endpoint/health.rs
+@@ -1,12 +1,17 @@
+ use std::time::{Duration, Instant};
+ 
+-pub(super) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
++pub(super) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+ pub(super) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
++/// An unanswered probe only marks the link stalled: roaming transports (e.g. Eternal Terminal)
++/// keep the stdio bridge open across outages and resume byte-exactly, which a teardown would
++/// throw away. A dead transport is detected by the bridge process exiting instead.
++pub(super) const STALL_TIMEOUT: Duration = Duration::from_secs(2);
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub(super) enum HealthAction {
+     None,
+     Ping,
++    Stalled,
+     Expired,
+ }
+ 
+@@ -15,6 +20,7 @@ pub(super) struct EndpointHealth {
+     last_received: Instant,
+     ping_sent_at: Option<Instant>,
+     ready: bool,
++    stalled: bool,
+ }
+ 
+ impl EndpointHealth {
+@@ -24,12 +30,23 @@ impl EndpointHealth {
+             last_received: now,
+             ping_sent_at: None,
+             ready: false,
++            stalled: false,
+         }
+     }
+ 
+-    pub(super) fn received(&mut self, now: Instant) {
++    /// Returns true when this message ends a stall.
++    pub(super) fn received(&mut self, now: Instant) -> bool {
+         self.last_received = now;
+         self.ping_sent_at = None;
++        std::mem::take(&mut self.stalled)
++    }
++
++    pub(super) fn is_stalled(&self) -> bool {
++        self.stalled
++    }
++
++    pub(super) fn stalled(&mut self) {
++        self.stalled = true;
+     }
+ 
+     pub(super) fn ready(&mut self) {
+@@ -41,9 +58,13 @@ impl EndpointHealth {
+             !self.ready && now.saturating_duration_since(self.connected_at) >= HEARTBEAT_TIMEOUT;
+         let probe_expired = self
+             .ping_sent_at
+-            .is_some_and(|sent_at| now.saturating_duration_since(sent_at) >= HEARTBEAT_TIMEOUT);
+-        if initial_snapshot_expired || probe_expired {
++            .is_some_and(|sent_at| now.saturating_duration_since(sent_at) >= STALL_TIMEOUT);
++        if initial_snapshot_expired {
+             HealthAction::Expired
++        } else if self.stalled {
++            HealthAction::None
++        } else if probe_expired {
++            HealthAction::Stalled
+         } else if self.ping_sent_at.is_none()
+             && now.saturating_duration_since(self.last_received) >= HEARTBEAT_INTERVAL
+         {
+@@ -63,16 +84,22 @@ mod tests {
+     use super::*;
+ 
+     #[test]
+-    fn quiet_connection_is_probed_then_expires_without_a_reply() {
++    fn quiet_connection_is_probed_then_stalls_without_a_reply() {
+         let now = Instant::now();
+         let mut health = EndpointHealth::new(now);
++        health.ready();
+         assert_eq!(health.action(now), HealthAction::None);
+         assert_eq!(health.action(now + HEARTBEAT_INTERVAL), HealthAction::Ping);
+         health.ping_sent(now + HEARTBEAT_INTERVAL);
++        let stalled_at = now + HEARTBEAT_INTERVAL + STALL_TIMEOUT;
++        assert_eq!(health.action(stalled_at), HealthAction::Stalled);
++        health.stalled();
+         assert_eq!(
+-            health.action(now + HEARTBEAT_INTERVAL + HEARTBEAT_TIMEOUT),
+-            HealthAction::Expired
++            health.action(stalled_at + Duration::from_secs(600)),
++            HealthAction::None
+         );
++        assert!(health.received(stalled_at + Duration::from_secs(601)));
++        assert!(!health.received(stalled_at + Duration::from_secs(602)));
+     }
+ 
+     #[test]
+@@ -81,8 +108,8 @@ mod tests {
+         let mut health = EndpointHealth::new(now);
+         health.ready();
+         health.ping_sent(now);
+-        health.received(now + HEARTBEAT_TIMEOUT - Duration::from_millis(1));
+-        assert_eq!(health.action(now + HEARTBEAT_TIMEOUT), HealthAction::None);
++        health.received(now + STALL_TIMEOUT - Duration::from_millis(1));
++        assert_eq!(health.action(now + STALL_TIMEOUT), HealthAction::None);
+     }
+ 
+     #[test]
+diff --git a/src/client/endpoint/registry.rs b/src/client/endpoint/registry.rs
+index 437f39f3..a653bd67 100644
+--- a/src/client/endpoint/registry.rs
++++ b/src/client/endpoint/registry.rs
+@@ -124,7 +124,13 @@ impl EndpointRegistry {
+             && self
+                 .connections
+                 .get(&self.active)
+-                .is_some_and(|connection| connection.surface_active)
++                .is_some_and(|connection| {
++                    connection.surface_active
++                        && !connection
++                            .health
++                            .as_ref()
++                            .is_some_and(EndpointHealth::is_stalled)
++                })
+     }
+ 
+     pub(crate) fn select_unavailable_local(&mut self) {
+@@ -179,15 +185,12 @@ impl EndpointRegistry {
+         endpoint_id: &ClientEndpointId,
+         generation: u64,
+         now: Instant,
+-    ) {
+-        if let Some(health) = self
+-            .connections
++    ) -> bool {
++        self.connections
+             .get_mut(endpoint_id)
+             .filter(|connection| connection.generation == generation)
+             .and_then(|connection| connection.health.as_mut())
+-        {
+-            health.received(now);
+-        }
++            .is_some_and(|health| health.received(now))
+     }
+ 
+     pub(crate) fn mark_ready(&mut self, endpoint_id: &ClientEndpointId, generation: u64) {
+@@ -201,7 +204,9 @@ impl EndpointRegistry {
+         }
+     }
+ 
+-    pub(crate) fn tick_health(&mut self, now: Instant) {
++    /// Returns endpoints that just stalled; they stay connected but stop accepting input.
++    pub(crate) fn tick_health(&mut self, now: Instant) -> Vec<ClientEndpointId> {
++        let mut stalled = Vec::new();
+         let actions = self
+             .connections
+             .iter()
+@@ -231,12 +236,23 @@ impl EndpointRegistry {
+                         }
+                     }
+                 }
++                HealthAction::Stalled => {
++                    if let Some(health) = self
++                        .connections
++                        .get_mut(&endpoint_id)
++                        .and_then(|connection| connection.health.as_mut())
++                    {
++                        health.stalled();
++                    }
++                    stalled.push(endpoint_id);
++                }
+                 HealthAction::Expired => self.record_failure(
+                     endpoint_id,
+                     io::Error::new(io::ErrorKind::TimedOut, "endpoint health check timed out"),
+                 ),
+             }
+         }
++        stalled
+     }
+ 
+     pub(crate) fn set_active(&mut self, endpoint_id: &ClientEndpointId) -> bool {
+@@ -493,7 +509,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn negotiated_remote_health_probe_expires_the_connection() {
++    fn silent_remote_stalls_without_teardown_and_drops_input_until_it_recovers() {
+         let mut registry = EndpointRegistry::new(
+             FakeTransport {
+                 sent: Arc::new(Mutex::new(Vec::new())),
+@@ -512,20 +528,56 @@ mod tests {
+             },
+             2,
+             negotiation(),
+-            false,
++            true,
+         );
++        assert!(registry.set_active(&ssh_id));
++        registry.mark_ready(&ssh_id, 2);
+         let now = Instant::now();
+-        registry.tick_health(now + super::super::health::HEARTBEAT_INTERVAL);
++        assert!(registry
++            .tick_health(now + super::super::health::HEARTBEAT_INTERVAL)
++            .is_empty());
+         assert!(matches!(
+             sent.lock().unwrap().as_slice(),
+             [ClientMessage::EndpointControl { kind, .. }]
+                 if kind == crate::protocol::endpoint::HEALTH_PING_KIND
+         ));
+ 
+-        registry.tick_health(
+-            now + super::super::health::HEARTBEAT_INTERVAL
+-                + super::super::health::HEARTBEAT_TIMEOUT,
++        let stalled_at =
++            now + super::super::health::HEARTBEAT_INTERVAL + super::super::health::STALL_TIMEOUT;
++        assert_eq!(registry.tick_health(stalled_at), vec![ssh_id.clone()]);
++        assert!(registry
++            .tick_health(stalled_at + std::time::Duration::from_secs(600))
++            .is_empty());
++        assert!(registry.connection(&ssh_id).is_some());
++        assert!(registry.take_failures().is_empty());
++        assert!(!registry.active_surface_available());
++
++        assert!(registry.received(&ssh_id, 2, stalled_at + std::time::Duration::from_secs(601)));
++        assert!(registry.active_surface_available());
++    }
++
++    #[test]
++    fn remote_without_initial_snapshot_expires() {
++        let mut registry = EndpointRegistry::new(
++            FakeTransport {
++                sent: Arc::new(Mutex::new(Vec::new())),
++                error: None,
++            },
++            1,
++            negotiation(),
++        );
++        let ssh_id = ClientEndpointId::Ssh(profile());
++        registry.insert(
++            ssh_id.clone(),
++            FakeTransport {
++                sent: Arc::new(Mutex::new(Vec::new())),
++                error: None,
++            },
++            2,
++            negotiation(),
++            false,
+         );
++        registry.tick_health(Instant::now() + super::super::health::HEARTBEAT_TIMEOUT);
+         assert!(registry.connection(&ssh_id).is_none());
+         assert_eq!(registry.take_failures()[0].kind, io::ErrorKind::TimedOut);
+     }
