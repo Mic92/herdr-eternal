@@ -18,7 +18,7 @@ Signed-off-by: Jörg Thalheim <joerg@thalheim.io>
  1 file changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/src/client/endpoint/supervisor.rs b/src/client/endpoint/supervisor.rs
-index 32a8870d..34dbe06c 100644
+index ccb1ebb1..c04d149c 100644
 --- a/src/client/endpoint/supervisor.rs
 +++ b/src/client/endpoint/supervisor.rs
 @@ -9,7 +9,9 @@ use crate::protocol::{ClientSurfaceSize, RenderEncoding};
@@ -32,7 +32,7 @@ index 32a8870d..34dbe06c 100644
  const MAX_LOCAL_RETRY_DELAY: Duration = Duration::from_secs(30);
  const STABLE_CONNECTION_PERIOD: Duration = Duration::from_secs(60);
  
-@@ -460,7 +462,7 @@ mod tests {
+@@ -471,7 +473,7 @@ mod tests {
              assert!(supervisors.disconnected(&id, 2, failed));
              assert_eq!(
                  supervisors.endpoints[&id].next_attempt,

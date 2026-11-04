@@ -21,10 +21,10 @@ Signed-off-by: Jörg Thalheim <joerg@thalheim.io>
  5 files changed, 42 insertions(+), 3 deletions(-)
 
 diff --git a/src/client/endpoint.rs b/src/client/endpoint.rs
-index 77aaae3b..c917fa0f 100644
+index f6ae4109..bac0c969 100644
 --- a/src/client/endpoint.rs
 +++ b/src/client/endpoint.rs
-@@ -91,6 +91,8 @@ impl ClientEndpointId {
+@@ -93,6 +93,8 @@ impl ClientEndpointId {
  pub(crate) enum ClientEndpointStatus {
      Connecting,
      Online,
@@ -34,10 +34,10 @@ index 77aaae3b..c917fa0f 100644
      Attention,
      Disabled,
 diff --git a/src/client/endpoint/supervisor.rs b/src/client/endpoint/supervisor.rs
-index a5154156..32a8870d 100644
+index efad076b..ccb1ebb1 100644
 --- a/src/client/endpoint/supervisor.rs
 +++ b/src/client/endpoint/supervisor.rs
-@@ -203,7 +203,7 @@ impl EndpointSupervisors {
+@@ -204,7 +204,7 @@ impl EndpointSupervisors {
          }
          state.in_flight = false;
          match status {
@@ -47,11 +47,11 @@ index a5154156..32a8870d 100644
                      state.attempts = 0;
                  }
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index cb465096..fcce7ca9 100644
+index f55db195..e6efe44d 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
-@@ -74,6 +74,28 @@ use terminal_setup::{
-     setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor,
+@@ -79,6 +79,28 @@ use terminal_setup::{
+     setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor, TerminalGuard,
  };
  
 +/// Only toggles between Online and Stalled; lifecycle states owned by the supervisor win.
@@ -79,7 +79,7 @@ index cb465096..fcce7ca9 100644
  fn refresh_host_mouse_capture(enabled: bool, sgr_pixels: bool) {
      if let Err(err) = set_mouse_capture(enabled, sgr_pixels) {
          warn!(err = %err, "failed to re-assert host mouse capture");
-@@ -1275,7 +1297,13 @@ async fn run_client_loop(
+@@ -1432,7 +1454,13 @@ async fn run_client_loop(
                  if !write_stream.accepts(&endpoint_id, generation) {
                      continue;
                  }
@@ -91,10 +91,10 @@ index cb465096..fcce7ca9 100644
 +                        endpoint::ClientEndpointStatus::Online,
 +                    );
 +                }
-                 let endpoint_active = write_stream.active_id() == &endpoint_id
-                     && write_stream
-                         .connection(&endpoint_id)
-@@ -2025,7 +2053,14 @@ async fn run_client_loop(
+                 // Retirements belong to the exact live connection, even after deactivation.
+                 // They must not be dropped with frozen/inactive presentation effects.
+                 if matches!(
+@@ -2239,7 +2267,14 @@ async fn run_client_loop(
                  state
                      .detached_process_children
                      .retain_mut(|child| child.try_wait().ok().flatten().is_none());
@@ -111,10 +111,10 @@ index cb465096..fcce7ca9 100644
                      if write_stream.connection(&failure.endpoint_id).is_some()
                          && !write_stream.accepts(&failure.endpoint_id, failure.generation)
 diff --git a/src/client/shell/endpoints.rs b/src/client/shell/endpoints.rs
-index c27358e5..59053a51 100644
+index 9e71d00a..ca2901a5 100644
 --- a/src/client/shell/endpoints.rs
 +++ b/src/client/shell/endpoints.rs
-@@ -680,6 +680,7 @@ pub(super) fn endpoint_status_presentation(
+@@ -723,6 +723,7 @@ pub(super) fn endpoint_status_presentation(
      match status {
          ClientEndpointStatus::Connecting => ("◐", "connecting", palette.yellow),
          ClientEndpointStatus::Online => ("●", "online", palette.green),
@@ -123,7 +123,7 @@ index c27358e5..59053a51 100644
          ClientEndpointStatus::Attention => ("!", "attention", palette.red),
          ClientEndpointStatus::Disabled => ("·", "disabled", palette.overlay0),
 diff --git a/src/client/shell/mobile.rs b/src/client/shell/mobile.rs
-index 8f06f54b..51935dd4 100644
+index f4ae0af0..23eaacc2 100644
 --- a/src/client/shell/mobile.rs
 +++ b/src/client/shell/mobile.rs
 @@ -206,6 +206,7 @@ fn mobile_endpoint_state(status: ClientEndpointStatus) -> &'static str {
