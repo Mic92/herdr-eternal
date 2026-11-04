@@ -28,10 +28,10 @@ Signed-off-by: Jörg Thalheim <joerg@thalheim.io>
  3 files changed, 19 insertions(+), 3 deletions(-)
 
 diff --git a/src/config/model.rs b/src/config/model.rs
-index 6ef6274d..4b9bf296 100644
+index 29802fd9..56ec6aa2 100644
 --- a/src/config/model.rs
 +++ b/src/config/model.rs
-@@ -1023,12 +1023,16 @@ pub struct RemoteConfig {
+@@ -1062,12 +1062,16 @@ pub struct RemoteConfig {
      /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
      /// Set false to run plain ssh unchanged. Default: true.
      pub manage_ssh_config: bool,
@@ -49,10 +49,10 @@ index 6ef6274d..4b9bf296 100644
      }
  }
 diff --git a/src/main.rs b/src/main.rs
-index 8cfe9b0b..94ba0bb8 100644
+index f97e7e2b..6597fcc1 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -403,6 +403,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+@@ -411,6 +411,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
  # Set false to run plain ssh against your ssh config unchanged — this does not
  # force keepalive or multiplexing off, it only stops herdr from adding its own.
  # manage_ssh_config = true
@@ -63,7 +63,7 @@ index 8cfe9b0b..94ba0bb8 100644
  [experimental]
  # Allow launching herdr from inside a herdr-managed pane.
 diff --git a/src/remote/attach.rs b/src/remote/attach.rs
-index 6a1ee6f9..4131e171 100644
+index 5d2dc3b6..86890503 100644
 --- a/src/remote/attach.rs
 +++ b/src/remote/attach.rs
 @@ -16,7 +16,7 @@ use interprocess::TryClone as _;
@@ -75,7 +75,7 @@ index 6a1ee6f9..4131e171 100644
  };
  use std::thread::{self, JoinHandle};
  use std::time::{Duration, Instant};
-@@ -600,7 +600,7 @@ impl RemoteSsh {
+@@ -835,7 +835,7 @@ impl RemoteSsh {
      }
  
      fn base_command(&self) -> Command {
@@ -84,7 +84,7 @@ index 6a1ee6f9..4131e171 100644
          apply_managed_ssh_options(&mut command, self.options());
          command
      }
-@@ -2707,6 +2707,15 @@ pub(crate) fn bridge_upload_cancellation_for_test(
+@@ -3038,6 +3038,15 @@ pub(crate) fn bridge_upload_cancellation_for_test(
      }
  }
  
@@ -100,7 +100,7 @@ index 6a1ee6f9..4131e171 100644
  fn bridge_connection(
      mut stream: crate::ipc::LocalStream,
      target: &str,
-@@ -2716,7 +2725,7 @@ fn bridge_connection(
+@@ -3047,7 +3056,7 @@ fn bridge_connection(
      bridge_stop: &Arc<AtomicBool>,
  ) -> io::Result<()> {
      let upload_stop = Arc::new(BridgeUploadStop::new()?);

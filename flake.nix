@@ -8,7 +8,7 @@
     crane.url = "github:ipetkov/crane";
     # Pinned to the commit the remote.ssh_command patch applies to.
     # Patches in nix/patches are generated against this tag; see nix/update-herdr-patches.sh.
-    herdr.url = "github:ogulcancelik/herdr/v0.9.1";
+    herdr.url = "github:ogulcancelik/herdr/v0.9.5";
   };
 
   outputs =
