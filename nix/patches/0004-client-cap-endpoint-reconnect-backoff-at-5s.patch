@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=B6rg=20Thalheim?= <joerg@thalheim.io>
+Date: Mon, 2 Nov 2026 10:30:32 +0100
+Subject: [PATCH 4/4] client: cap endpoint reconnect backoff at 5s
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Reconnect attempts while offline fail fast (no route, DNS failure), so
+the 120s cap mostly made users wait after connectivity returned: after
+a few minutes in a tunnel the next attempt could be two minutes away.
+A 5s cap also undercuts the 30s local cap; probing a local socket that
+often is cheap.
+
+Signed-off-by: Jörg Thalheim <joerg@thalheim.io>
+---
+ src/client/endpoint/supervisor.rs | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/client/endpoint/supervisor.rs b/src/client/endpoint/supervisor.rs
+index 32a8870d..34dbe06c 100644
+--- a/src/client/endpoint/supervisor.rs
++++ b/src/client/endpoint/supervisor.rs
+@@ -9,7 +9,9 @@ use crate::protocol::{ClientSurfaceSize, RenderEncoding};
+ use interprocess::TryClone as _;
+ 
+ const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
+-const MAX_RETRY_DELAY: Duration = Duration::from_secs(120);
++// Offline attempts fail fast, so a short cap gets users back within seconds of regaining
++// connectivity (e.g. leaving a train tunnel) instead of waiting out a long backoff.
++const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+ const MAX_LOCAL_RETRY_DELAY: Duration = Duration::from_secs(30);
+ const STABLE_CONNECTION_PERIOD: Duration = Duration::from_secs(60);
+ 
+@@ -460,7 +462,7 @@ mod tests {
+             assert!(supervisors.disconnected(&id, 2, failed));
+             assert_eq!(
+                 supervisors.endpoints[&id].next_attempt,
+-                Some(failed + INITIAL_RETRY_DELAY * (1 << (attempt - 1)))
++                Some(failed + (INITIAL_RETRY_DELAY * (1 << (attempt - 1))).min(MAX_RETRY_DELAY))
+             );
+         }
+         let connected = now + Duration::from_secs(200);

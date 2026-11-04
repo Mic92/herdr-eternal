@@ -7,7 +7,8 @@
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     crane.url = "github:ipetkov/crane";
     # Pinned to the commit the remote.ssh_command patch applies to.
-    herdr.url = "github:ogulcancelik/herdr/702aa1e45527509bec73dad9b8d443f449c0379b";
+    # Patches in nix/patches are generated against this tag; see nix/update-herdr-patches.sh.
+    herdr.url = "github:ogulcancelik/herdr/v0.9.1";
   };
 
   outputs =
@@ -43,9 +44,9 @@
           # herdr with the remote.ssh_command option, used by the herdr-driven
           # integration test in client/tests/.
           herdrPatched = herdr.packages.${pkgs.stdenv.hostPlatform.system}.herdr.overrideAttrs (old: {
-            patches = (old.patches or [ ]) ++ [
-              ./nix/patches/0001-remote-make-ssh-transport-program-configurable.patch
-            ];
+            patches =
+              (old.patches or [ ])
+              ++ map (name: ./nix/patches + "/${name}") (builtins.attrNames (builtins.readDir ./nix/patches));
           });
           commonArgs = {
             src = craneLib.cleanCargoSource ./.;

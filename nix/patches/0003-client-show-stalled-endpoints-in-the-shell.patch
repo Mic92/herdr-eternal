@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=B6rg=20Thalheim?= <joerg@thalheim.io>
+Date: Mon, 2 Nov 2026 10:30:32 +0100
+Subject: [PATCH 3/4] client: show stalled endpoints in the shell
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A stalled endpoint silently drops input, which looks like a frozen UI.
+Surface it as a "stalled" endpoint status so the existing lifecycle
+notice explains why panes stopped responding, and return to "online" as
+soon as traffic resumes.
+
+Signed-off-by: Jörg Thalheim <joerg@thalheim.io>
+---
+ src/client/endpoint.rs            |  2 ++
+ src/client/endpoint/supervisor.rs |  2 +-
+ src/client/mod.rs                 | 39 +++++++++++++++++++++++++++++--
+ src/client/shell/endpoints.rs     |  1 +
+ src/client/shell/mobile.rs        |  1 +
+ 5 files changed, 42 insertions(+), 3 deletions(-)
+
+diff --git a/src/client/endpoint.rs b/src/client/endpoint.rs
+index 77aaae3b..c917fa0f 100644
+--- a/src/client/endpoint.rs
++++ b/src/client/endpoint.rs
+@@ -91,6 +91,8 @@ impl ClientEndpointId {
+ pub(crate) enum ClientEndpointStatus {
+     Connecting,
+     Online,
++    /// Connected, but the link has gone silent; input is dropped until traffic resumes.
++    Stalled,
+     Reconnecting,
+     Attention,
+     Disabled,
+diff --git a/src/client/endpoint/supervisor.rs b/src/client/endpoint/supervisor.rs
+index a5154156..32a8870d 100644
+--- a/src/client/endpoint/supervisor.rs
++++ b/src/client/endpoint/supervisor.rs
+@@ -203,7 +203,7 @@ impl EndpointSupervisors {
+         }
+         state.in_flight = false;
+         match status {
+-            ClientEndpointStatus::Online => {
++            ClientEndpointStatus::Online | ClientEndpointStatus::Stalled => {
+                 if endpoint_id.is_local() {
+                     state.attempts = 0;
+                 }
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index cb465096..fcce7ca9 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -74,6 +74,28 @@ use terminal_setup::{
+     setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor,
+ };
+ 
++/// Only toggles between Online and Stalled; lifecycle states owned by the supervisor win.
++fn set_endpoint_link_status(
++    state: &mut ClientState,
++    endpoint_id: &endpoint::ClientEndpointId,
++    status: endpoint::ClientEndpointStatus,
++) {
++    let (cols, rows) = state.reported_size;
++    let Some(shell) = state.shell.as_mut() else {
++        return;
++    };
++    if !matches!(
++        shell.endpoint_status(endpoint_id),
++        Some(endpoint::ClientEndpointStatus::Online | endpoint::ClientEndpointStatus::Stalled)
++    ) {
++        return;
++    }
++    shell.set_endpoint_status(endpoint_id, status);
++    if let Some(frame) = shell.compose(cols, rows) {
++        state.present_frame(frame);
++    }
++}
++
+ fn refresh_host_mouse_capture(enabled: bool, sgr_pixels: bool) {
+     if let Err(err) = set_mouse_capture(enabled, sgr_pixels) {
+         warn!(err = %err, "failed to re-assert host mouse capture");
+@@ -1275,7 +1297,13 @@ async fn run_client_loop(
+                 if !write_stream.accepts(&endpoint_id, generation) {
+                     continue;
+                 }
+-                write_stream.received(&endpoint_id, generation, now);
++                if write_stream.received(&endpoint_id, generation, now) {
++                    set_endpoint_link_status(
++                        &mut state,
++                        &endpoint_id,
++                        endpoint::ClientEndpointStatus::Online,
++                    );
++                }
+                 let endpoint_active = write_stream.active_id() == &endpoint_id
+                     && write_stream
+                         .connection(&endpoint_id)
+@@ -2025,7 +2053,14 @@ async fn run_client_loop(
+                 state
+                     .detached_process_children
+                     .retain_mut(|child| child.try_wait().ok().flatten().is_none());
+-                write_stream.tick_health(now);
++                for endpoint_id in write_stream.tick_health(now) {
++                    warn!(endpoint = %endpoint_id.storage_key(), "endpoint link stalled");
++                    set_endpoint_link_status(
++                        &mut state,
++                        &endpoint_id,
++                        endpoint::ClientEndpointStatus::Stalled,
++                    );
++                }
+                 for failure in write_stream.take_failures() {
+                     if write_stream.connection(&failure.endpoint_id).is_some()
+                         && !write_stream.accepts(&failure.endpoint_id, failure.generation)
+diff --git a/src/client/shell/endpoints.rs b/src/client/shell/endpoints.rs
+index c27358e5..59053a51 100644
+--- a/src/client/shell/endpoints.rs
++++ b/src/client/shell/endpoints.rs
+@@ -680,6 +680,7 @@ pub(super) fn endpoint_status_presentation(
+     match status {
+         ClientEndpointStatus::Connecting => ("◐", "connecting", palette.yellow),
+         ClientEndpointStatus::Online => ("●", "online", palette.green),
++        ClientEndpointStatus::Stalled => ("◌", "stalled", palette.yellow),
+         ClientEndpointStatus::Reconnecting => ("◐", "reconnecting", palette.yellow),
+         ClientEndpointStatus::Attention => ("!", "attention", palette.red),
+         ClientEndpointStatus::Disabled => ("·", "disabled", palette.overlay0),
+diff --git a/src/client/shell/mobile.rs b/src/client/shell/mobile.rs
+index 8f06f54b..51935dd4 100644
+--- a/src/client/shell/mobile.rs
++++ b/src/client/shell/mobile.rs
+@@ -206,6 +206,7 @@ fn mobile_endpoint_state(status: ClientEndpointStatus) -> &'static str {
+     match status {
+         ClientEndpointStatus::Connecting => "connecting",
+         ClientEndpointStatus::Online => "online",
++        ClientEndpointStatus::Stalled => "stalled",
+         ClientEndpointStatus::Reconnecting => "reconnecting",
+         ClientEndpointStatus::Attention => "attention",
+         ClientEndpointStatus::Disabled => "disabled",
