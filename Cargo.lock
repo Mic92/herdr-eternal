@@ -552,7 +552,7 @@ name = "herdr-eternal-server"
 version = "0.1.0"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "futures-util",
  "herdr-eternal-proto",
  "herdr-eternal-server",
